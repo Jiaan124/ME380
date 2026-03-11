@@ -12,12 +12,6 @@ def generate_launch_description():
     pkg_share = get_package_share_directory('me380_driver')
     config = os.path.join(pkg_share, 'config', 'driver_params.yaml')
 
-    serial_port_arg = DeclareLaunchArgument(
-        'serial_port',
-        default_value='/dev/ttyUSB0',
-        description='Serial port for motor controller (e.g. /dev/ttyUSB0)',
-    )
-
     node = Node(
         package='me380_driver',
         executable='driver_node_py.py',
@@ -26,4 +20,4 @@ def generate_launch_description():
         parameters=[config, {'serial_port': LaunchConfiguration('serial_port')}],
     )
 
-    return LaunchDescription([serial_port_arg, node])
+    return LaunchDescription([node])

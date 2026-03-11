@@ -7,6 +7,13 @@ Edit the variables below, then run. Uses RPi.GPIO on Raspberry Pi; use --no-gpio
 import sys
 import time
 
+"""
+  X (J1)     Step 17 -> D2,  Dir 27 -> D5
+  Y (J2)     Step 22 -> D3,  Dir 23 -> D6
+  Z (J3)     Step 24 -> D4,  Dir 25 -> D7
+  A (J4)     Step  5 -> D12, Dir  6 -> D13
+"""
+
 try:
     import RPi.GPIO as GPIO
     HAS_GPIO = True
@@ -17,9 +24,9 @@ except ImportError:
 # ----- Edit these -----
 NUM_STEPS = 300
 TIME_BETWEEN_STEPS_S = 0.1  # seconds between steps (0.01 = 100 steps/sec)
-STEP_PIN = 17   # BCM GPIO for step (J1)
-DIR_PIN = 27    # BCM GPIO for dir (J1)
-STEP_PULSE = 0.005
+STEP_PIN = 17
+DIR_PIN = 27
+STEP_PULSE = 0.002
 # ----------------------
 
 

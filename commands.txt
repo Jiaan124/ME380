@@ -1,0 +1,6 @@
+
+
+ros2 topic pub -1 /joint_states sensor_msgs/msg/JointState "{header: {frame_id: ''}, position: [0.4, 0.4, 0.4, 0.0, 0.0, 0.0, 0.0]}"
+ros2 topic pub -1 /joint_states sensor_msgs/msg/JointState "{header: {frame_id: ''}, position: [-0.4, -0.4, -0.4, 0.0, 0.0, 0.0, 0.0]}"
+
+ros2 launch me380_driver driver_python.launch.py

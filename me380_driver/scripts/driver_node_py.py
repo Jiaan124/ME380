@@ -15,10 +15,11 @@ Wiring: Pi GPIO (BCM) -> CNC Shield (Arduino Uno digital pin)
 
 Use 3.3V-to-5V level shifters between Pi and shield for reliable operation.
 
-Joint mapping (JointState name -> position in rad):
-  joint1/j1 .. joint4/j4 -> stepper J1..J4 delta (rad, we use delta from last)
-  joint5/j5, joint6/j6   -> differential servo angles (rad)
-  joint7/gripper         -> end effector (0 = open, 1 = closed, threshold 0.5 rad)
+Joint mapping (JointState.position array only; names are ignored):
+  position[0..3] -> stepper J1..J4 (rad; driver uses delta from last)
+  position[4], position[5] -> differential servo angles (rad)
+  position[6] -> gripper (0 = open, >0.5 = closed)
+  For 6-joint: position[0..2] steppers, position[3], position[4] diff, position[5] gripper.
 """
 
 import math
@@ -59,15 +60,6 @@ EE_CLOSE_DEG = 100.0
 SERVO_HZ = 50
 STEP_PULSE_US = 5
 STEP_PULSE_S = STEP_PULSE_US / 1e6
-
-
-def index_of(names: list, *candidates: str) -> int:
-    for c in candidates:
-        try:
-            return names.index(c)
-        except ValueError:
-            continue
-    return -1
 
 
 def _pulse_us_to_duty(pulse_us: float) -> float:
@@ -247,48 +239,32 @@ class DriverNode(Node):
         self._servo_timer = self.create_timer(SERVO_UPDATE_PERIOD_S, self._servo_tick)
 
     def _on_joint_state(self, msg):
-        names = msg.name
-        position = msg.position
-        if len(names) != len(position) or len(names) == 0:
+        position = list(msg.position) if msg.position else []
+        # Expect position only: [j1, j2, j3, j4, j5, j6, gripper] (7) or [j1, j2, j3, j4, j5, gripper] (6). Names ignored.
+        if len(position) < 6:
             self.get_logger().warn_throttle(
-                1.0, "JointState name/position size mismatch or empty"
+                1.0, "JointState position must have at least 6 elements (j1..j5 + gripper)"
             )
             return
 
-        i1 = index_of(names, "joint1", "j1")
-        i2 = index_of(names, "joint2", "j2")
-        i3 = index_of(names, "joint3", "j3")
-        i4 = index_of(names, "joint4", "j4")
-        i5 = index_of(names, "joint5", "j5")
-        i6 = index_of(names, "joint6", "j6")
-        i7 = index_of(names, "joint7", "gripper")
-
-        # Support 7-joint (j1..j4 steppers, j5,j6 diff, j7 gripper) and 6-joint (j1..j3 steppers, j4,j5 diff, j6 gripper)
-        seven_joint = i7 >= 0
-        if seven_joint:
-            j1_rad = position[i1] if i1 >= 0 else 0.0
-            j2_rad = position[i2] if i2 >= 0 else 0.0
-            j3_rad = position[i3] if i3 >= 0 else 0.0
-            j4_rad = position[i4] if i4 >= 0 else 0.0
-            j5_rad = position[i5] if i5 >= 0 else 0.0
-            j6_rad = position[i6] if i6 >= 0 else 0.0
-            j7_rad = position[i7]
-            diff_a_rad = j5_rad
-            diff_b_rad = j6_rad
-            gripper_rad = j7_rad
-            j4_stepper_rad = j4_rad
+        if len(position) >= 7:
+            # 7-joint: [j1, j2, j3, j4, j5, j6, gripper]
+            j1_rad = position[0]
+            j2_rad = position[1]
+            j3_rad = position[2]
+            j4_stepper_rad = position[3]
+            diff_a_rad = position[4]
+            diff_b_rad = position[5]
+            gripper_rad = position[6]
         else:
-            j1_rad = position[i1] if i1 >= 0 else 0.0
-            j2_rad = position[i2] if i2 >= 0 else 0.0
-            j3_rad = position[i3] if i3 >= 0 else 0.0
-            j4_rad = position[i4] if i4 >= 0 else 0.0
-            j5_rad = position[i5] if i5 >= 0 else 0.0
-            j6_rad = position[i6] if i6 >= 0 else 0.0
-            j7_rad = 0.0
-            diff_a_rad = j4_rad
-            diff_b_rad = j5_rad
-            gripper_rad = j6_rad
+            # 6-joint: [j1, j2, j3, j4, j5, gripper] — j4,j5 are diff servos, no 4th stepper
+            j1_rad = position[0]
+            j2_rad = position[1]
+            j3_rad = position[2]
             j4_stepper_rad = 0.0
+            diff_a_rad = position[3]
+            diff_b_rad = position[4]
+            gripper_rad = position[5]
 
         j1_deg = j1_rad * RAD_TO_DEG
         j2_deg = j2_rad * RAD_TO_DEG
