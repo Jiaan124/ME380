@@ -15,6 +15,9 @@ Wiring: Pi GPIO (BCM) -> CNC Shield (Arduino Uno digital pin)
 
 Use 3.3V-to-5V level shifters between Pi and shield for reliable operation.
 
+Servos: If pigpio is installed and use_pigpio is true, GPIO 12/13/18 use hardware PWM
+(via pigpio) for stable timing and less jitter. Ensure the daemon is running: sudo pigpiod
+
 Joint mapping (JointState.position array only; names are ignored):
   position[0..3] -> stepper J1..J4 (rad; driver uses delta from last)
   position[4], position[5] -> differential servo angles (rad)
@@ -36,6 +39,11 @@ try:
 except ImportError:
     GPIO = None
 
+try:
+    import pigpio
+except ImportError:
+    pigpio = None
+
 
 RAD_TO_DEG = 180.0 / math.pi
 
@@ -52,14 +60,15 @@ PWM_MIN = 500
 PWM_MAX = 2500
 SERVO_RANGE_DEG = 135.0
 US_PER_DEG = 2000.0 / 270.0
-SERVO_SMOOTH_US_PER_SEC = 400.0
-SERVO_UPDATE_PERIOD_S = 0.02
 EE_OPEN_DEG = 155.0
 EE_CLOSE_DEG = 100.0
 
 SERVO_HZ = 50
 STEP_PULSE_US = 5
 STEP_PULSE_S = STEP_PULSE_US / 1e6
+# Match ik.cpp (ESP32/Arduino): 20 ms update, step toward target at 400 us/s. Hardware timers there give stable PWM; we match the logic.
+SERVO_SPEED_US_PER_SEC = 400.0
+SERVO_UPDATE_PERIOD_S = 0.02
 
 
 def _pulse_us_to_duty(pulse_us: float) -> float:
@@ -89,6 +98,7 @@ class DriverNode(Node):
         self.declare_parameter("gpio_servo_a", 12)
         self.declare_parameter("gpio_servo_b", 13)
         self.declare_parameter("gpio_servo_ee", 18)
+        self.declare_parameter("use_pigpio", True)
 
         self.declare_parameter("joint_state_topic", "joint_states")
         self.declare_parameter("max_stepper_delta_per_msg", 360.0)
@@ -110,6 +120,7 @@ class DriverNode(Node):
         self.gpio_servo_a = self.get_parameter("gpio_servo_a").value
         self.gpio_servo_b = self.get_parameter("gpio_servo_b").value
         self.gpio_servo_ee = self.get_parameter("gpio_servo_ee").value
+        use_pigpio_param = self.get_parameter("use_pigpio").value
         self.joint_state_topic = self.get_parameter("joint_state_topic").value
         self.max_stepper_delta = self.get_parameter("max_stepper_delta_per_msg").value
         self.max_steps_per_sec = self.get_parameter("max_steps_per_sec").value
@@ -127,8 +138,10 @@ class DriverNode(Node):
         self._step_lock = threading.Lock()
         self._target_pwm_a = PWM_CENTER
         self._target_pwm_b = PWM_CENTER
-        self._current_pwm_a = PWM_CENTER
-        self._current_pwm_b = PWM_CENTER
+        self._current_pwm_a = float(PWM_CENTER)
+        self._current_pwm_b = float(PWM_CENTER)
+        self._last_written_pwm_a = PWM_CENTER
+        self._last_written_pwm_b = PWM_CENTER
         self._last_servo_update = 0.0
         self._ee_closed = False
         self._last_j_deg = [0.0, 0.0, 0.0, 0.0]
@@ -136,9 +149,25 @@ class DriverNode(Node):
         self._pwma = None
         self._pwmb = None
         self._pwmee = None
+        self._pi = None
+        self._use_pigpio_servos = False
         self._stepper_thread = None
         self._servo_timer = None
         self._shutdown = False
+
+        if pigpio is not None and use_pigpio_param:
+            try:
+                self._pi = pigpio.pi()
+                if self._pi.connected:
+                    self._use_pigpio_servos = True
+                    self.get_logger().info("Using pigpio hardware PWM for servos (GPIO 12, 13, 18).")
+                else:
+                    self._pi.stop()
+                    self._pi = None
+            except Exception as e:
+                self.get_logger().warn("pigpio not available (%s), using RPi.GPIO for servos." % e)
+        if not self._use_pigpio_servos and pigpio is None:
+            self.get_logger().info("pigpio not installed; using RPi.GPIO software PWM for servos.")
 
         if GPIO is None:
             self.get_logger().error("RPi.GPIO not available. Install with: pip install RPi.GPIO")
@@ -146,7 +175,7 @@ class DriverNode(Node):
 
         self._setup_gpio()
         self._start_stepper_thread()
-        self._start_servo_smoothing()
+        self._start_servo_update_timer()
 
         self.sub = self.create_subscription(
             JointState,
@@ -161,24 +190,28 @@ class DriverNode(Node):
     def _setup_gpio(self):
         GPIO.setwarnings(False)
         GPIO.setmode(GPIO.BCM)
-        all_pins = (
-            [self.gpio_enable]
-            + self.step_pins
-            + self.dir_pins
-            + [self.gpio_servo_a, self.gpio_servo_b, self.gpio_servo_ee]
-        )
-        for p in all_pins:
+        # Steppers + enable always via RPi.GPIO; servo pins only if not using pigpio
+        stepper_pins = [self.gpio_enable] + self.step_pins + self.dir_pins
+        if not self._use_pigpio_servos:
+            stepper_pins += [self.gpio_servo_a, self.gpio_servo_b, self.gpio_servo_ee]
+        for p in stepper_pins:
             GPIO.setup(p, GPIO.OUT, initial=GPIO.LOW)
         # Enable drivers (LOW = enabled on most CNC shields)
         GPIO.output(self.gpio_enable, GPIO.LOW)
 
-        # Servo PWM at 50 Hz
-        self._pwma = GPIO.PWM(self.gpio_servo_a, SERVO_HZ)
-        self._pwmb = GPIO.PWM(self.gpio_servo_b, SERVO_HZ)
-        self._pwmee = GPIO.PWM(self.gpio_servo_ee, SERVO_HZ)
-        self._pwma.start(_pulse_us_to_duty(PWM_CENTER))
-        self._pwmb.start(_pulse_us_to_duty(PWM_CENTER))
-        self._pwmee.start(_pulse_us_to_duty(_angle_deg_to_pulse_us(EE_OPEN_DEG)))  # open
+        if self._use_pigpio_servos and self._pi is not None:
+            # pigpio hardware PWM: set_servo_pulsewidth uses us (500–2500), stable timing
+            self._pi.set_servo_pulsewidth(self.gpio_servo_a, PWM_CENTER)
+            self._pi.set_servo_pulsewidth(self.gpio_servo_b, PWM_CENTER)
+            self._pi.set_servo_pulsewidth(self.gpio_servo_ee, int(_angle_deg_to_pulse_us(EE_OPEN_DEG)))
+        else:
+            # RPi.GPIO software PWM
+            self._pwma = GPIO.PWM(self.gpio_servo_a, SERVO_HZ)
+            self._pwmb = GPIO.PWM(self.gpio_servo_b, SERVO_HZ)
+            self._pwmee = GPIO.PWM(self.gpio_servo_ee, SERVO_HZ)
+            self._pwma.start(_pulse_us_to_duty(PWM_CENTER))
+            self._pwmb.start(_pulse_us_to_duty(PWM_CENTER))
+            self._pwmee.start(_pulse_us_to_duty(_angle_deg_to_pulse_us(EE_OPEN_DEG)))
 
     def _steps_for_delta_deg(self, axis: int, delta_deg: float) -> int:
         return int(round(delta_deg * STEPS_PER_REV * self.gear_ratios[axis] / 360.0))
@@ -209,34 +242,55 @@ class DriverNode(Node):
         self._stepper_thread = threading.Thread(target=self._stepper_loop, daemon=True)
         self._stepper_thread.start()
 
+    def _step_toward(self, current: float, target: float, step: float) -> float:
+        """Match ik.cpp stepToward: move current toward target by at most step."""
+        if abs(target - current) <= step:
+            return target
+        return current + (step if target > current else -step)
+
+    def _servo_tick(self):
+        """Match ik.cpp updateServos(): every UPDATE_PERIOD_S, step current toward target and write integer us (stable values)."""
+        if self._use_pigpio_servos:
+            if self._pi is None or not self._pi.connected:
+                return
+        else:
+            if self._pwma is None or self._pwmb is None:
+                return
+        now = time.monotonic()
+        if now - self._last_servo_update < SERVO_UPDATE_PERIOD_S:
+            return
+        self._last_servo_update = now
+        step_us = SERVO_SPEED_US_PER_SEC * SERVO_UPDATE_PERIOD_S
+        self._current_pwm_a = self._step_toward(self._current_pwm_a, self._target_pwm_a, step_us)
+        self._current_pwm_b = self._step_toward(self._current_pwm_b, self._target_pwm_b, step_us)
+        cur_a = int(round(self._current_pwm_a))
+        cur_b = int(round(self._current_pwm_b))
+        if self._use_pigpio_servos and self._pi is not None:
+            if cur_a != self._last_written_pwm_a:
+                self._last_written_pwm_a = cur_a
+                self._pi.set_servo_pulsewidth(self.gpio_servo_a, cur_a)
+            if cur_b != self._last_written_pwm_b:
+                self._last_written_pwm_b = cur_b
+                self._pi.set_servo_pulsewidth(self.gpio_servo_b, cur_b)
+        else:
+            if cur_a != self._last_written_pwm_a:
+                self._last_written_pwm_a = cur_a
+                self._pwma.ChangeDutyCycle(_pulse_us_to_duty(cur_a))
+            if cur_b != self._last_written_pwm_b:
+                self._last_written_pwm_b = cur_b
+                self._pwmb.ChangeDutyCycle(_pulse_us_to_duty(cur_b))
+
+    def _start_servo_update_timer(self):
+        self._servo_timer = self.create_timer(SERVO_UPDATE_PERIOD_S, self._servo_tick)
+
     def _move_differential(self, angle4_deg: float, angle5_deg: float):
+        """Set target PWM for differential servos (ik.cpp: targetPwmA/B). Smoothing happens in _servo_tick."""
         angle_a = SERVO_GEAR_REDUCTION * (angle4_deg + angle5_deg)
         angle_b = SERVO_GEAR_REDUCTION * (-angle4_deg + angle5_deg)
         angle_a = max(-SERVO_RANGE_DEG, min(SERVO_RANGE_DEG, angle_a))
         angle_b = max(-SERVO_RANGE_DEG, min(SERVO_RANGE_DEG, angle_b))
         self._target_pwm_a = int(max(PWM_MIN, min(PWM_MAX, PWM_CENTER + angle_a * US_PER_DEG)))
         self._target_pwm_b = int(max(PWM_MIN, min(PWM_MAX, PWM_CENTER + angle_b * US_PER_DEG)))
-
-    def _step_toward(self, current: float, target: float, step: float) -> float:
-        if abs(target - current) <= step:
-            return target
-        return current + (step if target > current else -step)
-
-    def _servo_tick(self):
-        if self._pwma is None:
-            return
-        now = time.monotonic()
-        if now - self._last_servo_update < SERVO_UPDATE_PERIOD_S:
-            return
-        self._last_servo_update = now
-        step_us = SERVO_SMOOTH_US_PER_SEC * SERVO_UPDATE_PERIOD_S
-        self._current_pwm_a = self._step_toward(self._current_pwm_a, self._target_pwm_a, step_us)
-        self._current_pwm_b = self._step_toward(self._current_pwm_b, self._target_pwm_b, step_us)
-        self._pwma.ChangeDutyCycle(_pulse_us_to_duty(self._current_pwm_a))
-        self._pwmb.ChangeDutyCycle(_pulse_us_to_duty(self._current_pwm_b))
-
-    def _start_servo_smoothing(self):
-        self._servo_timer = self.create_timer(SERVO_UPDATE_PERIOD_S, self._servo_tick)
 
     def _on_joint_state(self, msg):
         position = list(msg.position) if msg.position else []
@@ -295,22 +349,33 @@ class DriverNode(Node):
             self._pending_steps[2] += self._steps_for_delta_deg(2, d3)
             self._pending_steps[3] += self._steps_for_delta_deg(3, d4)
 
-        # Differential servos
+        # Differential servos: set targets; _servo_tick steps toward them (same logic as ik.cpp)
         self._move_differential(diff_a_deg, diff_b_deg)
 
         # End effector
         closed = gripper_rad > 0.5
         if closed != self._ee_closed:
             self._ee_closed = closed
-            if self._pwmee is not None:
-                angle = EE_CLOSE_DEG if closed else EE_OPEN_DEG
-                pulse_us = max(PWM_MIN, min(PWM_MAX, _angle_deg_to_pulse_us(angle)))
+            angle = EE_CLOSE_DEG if closed else EE_OPEN_DEG
+            pulse_us = int(max(PWM_MIN, min(PWM_MAX, _angle_deg_to_pulse_us(angle))))
+            if self._use_pigpio_servos and self._pi is not None:
+                self._pi.set_servo_pulsewidth(self.gpio_servo_ee, pulse_us)
+            elif self._pwmee is not None:
                 self._pwmee.ChangeDutyCycle(_pulse_us_to_duty(pulse_us))
 
     def destroy_node(self, *args, **kwargs):
         self._shutdown = True
+        if self._servo_timer is not None:
+            self._servo_timer.cancel()
+            self._servo_timer = None
         if self._stepper_thread is not None:
             self._stepper_thread.join(timeout=1.0)
+        if self._pi is not None and self._pi.connected:
+            self._pi.set_servo_pulsewidth(self.gpio_servo_a, 0)
+            self._pi.set_servo_pulsewidth(self.gpio_servo_b, 0)
+            self._pi.set_servo_pulsewidth(self.gpio_servo_ee, 0)
+            self._pi.stop()
+            self._pi = None
         if self._pwma is not None:
             self._pwma.stop()
         if self._pwmb is not None:
