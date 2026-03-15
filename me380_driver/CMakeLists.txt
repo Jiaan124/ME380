@@ -6,7 +6,7 @@ find_package(ament_cmake REQUIRED)
 install(PROGRAMS scripts/driver_node_py.py
   DESTINATION lib/${PROJECT_NAME})
 
-install(DIRECTORY config launch urdf
+install(DIRECTORY launch urdf
   DESTINATION share/${PROJECT_NAME}
 )
 

@@ -4,3 +4,4 @@ ros2 topic pub -1 /joint_states sensor_msgs/msg/JointState "{header: {frame_id: 
 ros2 topic pub -1 /joint_states sensor_msgs/msg/JointState "{header: {frame_id: ''}, position: [-0.4, -0.4, -0.4, 0.0, 0.0, 0.0, 0.0]}"
 
 ros2 launch me380_driver driver_python.launch.py
+os2 run xacro xacro me380_driver/urdf/me380_robot.urdf.xacro -o me380_driver/urdf/me380_robot.urdf

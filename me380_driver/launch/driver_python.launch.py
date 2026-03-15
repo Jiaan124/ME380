@@ -17,7 +17,7 @@ def generate_launch_description():
         executable='driver_node_py.py',
         name='driver_node_py',
         output='screen',
-        parameters=[config, {'serial_port': LaunchConfiguration('serial_port')}],
+        # parameters=[config, {'serial_port': LaunchConfiguration('serial_port')}],
     )
 
     return LaunchDescription([node])
