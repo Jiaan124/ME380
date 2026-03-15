@@ -21,20 +21,19 @@
   <!-- Cross-section thickness for arm links -->
   <xacro:property name="thick" value="0.03"/>
   <!-- Height and offset of slanted shoulder-->
-  <xacro:property name="link1_height" value="0.2"/>
+  <xacro:property name="link1_height" value="0.2391"/>
   <xacro:property name="link1_side_offset" value="-0.0622"/>
 
   <!-- Elbow (middle piece) length -->
-  <xacro:property name="link2_len" value="0.21575"/>
-  <!-- 3rd to 4th dof length (4th dof is new added dof) -->
-  <xacro:property name="link3_len" value="0.08"/>
-  <xacro:property name="link3_cz" value="${link3_len/2}"/>  <!-- center at 0, 0, 0.5 -->
+  <xacro:property name="link2_len" value="0.2355"/>
+  <!-- 3rd to 4th dof length (4th dof is new added dof) to face of 4th dof -->
+  <xacro:property name="link3_len" value="0.103"/>
   <!-- end of 4th dof to write differential -->
-  <xacro:property name="link4_len" value="0.1"/>
+  <xacro:property name="link4_len" value="0.110"/>
   <!-- placeholder length -->
   <xacro:property name="link5_len" value="0.0"/>
-  <!-- link6: end-effector flange at tip -->
-  <xacro:property name="gripper_len" value="0.1"/>
+  <!-- link6: diff to midl of gripper dist-->
+  <xacro:property name="gripper_len" value="0.112"/>
 
   <!-- ============ Base ============ -->
   <link name="base_link">
