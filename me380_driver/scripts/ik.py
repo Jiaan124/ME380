@@ -4,17 +4,66 @@ import numpy as np
 import ikpy.utils.plot as plot_utils
 import matplotlib.pyplot as plt
 import math
+from scipy.spatial.transform import Rotation as R
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import JointState
+from std_msgs.msg import Float64MultiArray
+
+class ikNode(Node):
+    def __init__(self):
+        super().__init__("ik")
+        self.declare_parameter("filepath","me380_robot.urdf" )
+        self.filepath = self.get_parameter("filepath").value
+        self.publisher_ = self.create_publisher(JointState, "joint_angles", 10) #message type, topic name, buffer size
+        self.sub = self.create_subscription(  #take in x, y, z and euler angles? or should it take in x y z and rotation matrix?
+            Float64MultiArray,
+            self.target_position,
+            self._on_joint_state,
+            10,
+        )
+
+    # Create a timer to call the callback at 10Hz
+        self.timer = self.create_timer(0.1, self.timer_callback)
+        self.my_chain = ikpy.chain.Chain.from_urdf_file("filepath", active_links_mask=[False, True, True, True, True, True, True, False])
+        #add initial position fro solver
+        self.old_position = [0, 0, 0, 0, 0, 0]
+
+    def target_position(self, msg):
+        target_position = [ 0.2, .2, 0.2]
+        r = R.from_euler('yz', [-90,45], degrees=True)
+        target_orientation = r.as_matrix()
+        ik = self.my_chain.inverse_kinematics(target_position, target_orientation, orientation_mode="all", initial_position=self.old_position)
+        self.old_position = ik
+
+        msg = JointState()
+        msg.position = ik.tolist()
+        print("Joint Angles: ", list(map(lambda r:math.degrees(r),ik.tolist())))
+        self.publisher_.publish(msg)        
 
 
-my_chain = ikpy.chain.Chain.from_urdf_file("me380_robot.urdf", active_links_mask=[False, True, True, True, True, True, True, False])
+    # def timer_callback(self):
+    #     target_position = [ 0.2, .2, 0.2]
+    #     r = R.from_euler('yz', [-90,45], degrees=True)
+    #     target_orientation = r.as_matrix()
+    #     ik = self.my_chain.inverse_kinematics(target_position, target_orientation, orientation_mode="all", initial_position=self.old_position)
+    #     self.old_position = ik
 
-target_position = [ 0.2, .2, 0.2]
-target_orientation = [-1, 0, 0]
+    #     msg = JointState()
+    #     msg.position = ik.tolist()
+    #     print("Joint Angles: ", list(map(lambda r:math.degrees(r),ik.tolist())))
+    #     self.publisher_.publish(msg)
 
-ik = my_chain.inverse_kinematics(target_position, target_orientation, orientation_mode="X")
-print("The angles of each joints are : ", list(map(lambda r:math.degrees(r),ik.tolist())))
+def main(args=None):
+    rclpy.init(args=args)
+    node = ikNode()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
 
-print("The angles of each joints are : ", my_chain.inverse_kinematics(target_position))
+if __name__ == '__main__':
+    main()
+
 
 # ax = plt.figure().add_subplot(111, projection='3d')
 fig, ax = plot_utils.init_3d_figure()
@@ -50,4 +99,9 @@ def move(x,y,z):
     updatePlot()
 
 
-    # sendCommand(ik[1].item(),ik[2].item(),ik[3].item(),ik[4].item(),ik[5].item(),ik[6].item(),1)
+#TODO: Add home position
+#TODO: Create way to define straight x y z trajectory
+#TODO: Integrate with ROS node. Should I have high level motion planning in same node or different node - Should this node only 
+#handle IK or should it also remember waypoints. Maybe have this node take in target position and then it generates a trajectory
+#to get to that target position. Maybe have way to toggle between joint space vs cartension control
+
