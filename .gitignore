@@ -3,3 +3,5 @@ build/
 install/
 log/
 me380_driver/pigpio-master/
+jork_assembly
+.vscode

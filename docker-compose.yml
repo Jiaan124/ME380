@@ -1,0 +1,17 @@
+services:
+  me380:
+    build: .
+    image: me380-ros2-humble
+    container_name: me380
+    working_dir: /me380
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+    volumes:
+      - .:/me380
+      # X11 socket (Linux) — required for GUIs to show on host
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    # Optional: use host network for ROS_DOMAIN_ID / DDS discovery
+    # network_mode: host
+    stdin_open: true
+    tty: true
