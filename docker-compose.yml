@@ -11,7 +11,7 @@ services:
       - .:/me380
       # X11 socket (Linux) — required for GUIs to show on host
       - /tmp/.X11-unix:/tmp/.X11-unix
-    # Optional: use host network for ROS_DOMAIN_ID / DDS discovery
-    # network_mode: host
+    # Use host network so ROS2 DDS discovery and node communication work with other machines (e.g. Raspberry Pi)
+    network_mode: host
     stdin_open: true
     tty: true

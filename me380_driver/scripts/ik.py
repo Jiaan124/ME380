@@ -22,60 +22,85 @@ class ikNode(Node):
         self.filepath = self.get_parameter("filepath").value
         self.publisher_ = self.create_publisher(JointState, "joint_angles", 10) #message type, topic name, buffer size
         self.sub = self.create_subscription(  #take in x, y, z and euler angles? or should it take in x y z and rotation matrix?
+            Float64MultiArray,  #data type
+            'target_position_joint_space', #topic name
+            self.joint_targ_callback, #callback
+            10,
+        )
+        self.sub = self.create_subscription(  #take in x, y, z and euler angles? or should it take in x y z and rotation matrix?
             Float64MultiArray,
-            self.target_position,
-            self._on_joint_state,
+            'target_position_xyz_space',
+            self.xyz_targ_callback,
             10,
         )
         self.sub = self.create_subscription(  #take in x, y, z and euler angles? or should it take in x y z and rotation matrix?
             JointState,
-            self.actual_joint_position,
-            self._on_motor_state,
+            'actual_joint_position',
+            self.actual_state_callback,
             10,
         )
 
         #toggle between joint space command and cartesian space command
         self.declare_parameter("joint_space", True)
         self.joint_space = self.get_parameter("joint_space").value
+        # self.timer = self.create_timer(0.02, self.timer_callback) #50hz control loop
 
-    # Create a timer to call the callback at 10Hz
-        self.timer = self.create_timer(0.1, self.timer_callback)
-        self.my_chain = ikpy.chain.Chain.from_urdf_file("filepath", active_links_mask=[False, True, True, True, True, True, True, False])
-        #add initial position fro solver
-        self.current_position = [0, 0, 0, 0, 0, 0]
+        self.my_chain = ikpy.chain.Chain.from_urdf_file(self.filepath, active_links_mask=[False, True, True, True, True, True, True, False])
+        #needed to have correct arm orientation when solving 2.64 rad = 151 deg, 1.57 rad = 90
+        self.current_position = None
+        self.ik = [0, 0, 2.64, 1.571, 0.0, 1.0, 0, 0] 
 
-    def actual_joint_position(self, msg):
-        self.current_position = msg.position
+    def actual_state_callback(self, msg):
+        # pad with extra 0 at beginning and end so ik can solve
+        self.current_position = [0.0] + list(msg.position) + [0.0]
 
-    def target_position(self, msg):
-        target_position = msg[:3]
-        r = R.from_euler('xyz', msg[3:], degrees=True)
+    def joint_targ_callback(self, msg):
+        target_position = msg.data[:3]
+        r = R.from_euler('xyz', msg.data[3:], degrees=True)
         target_orientation = r.as_matrix()
+        self.joint_space = self.get_parameter("joint_space").value
 
         if self.joint_space: #move in joint space to target orientation
-            ik = self.my_chain.inverse_kinematics(target_position, target_orientation, orientation_mode="all", initial_position=self.old_position)
-            self.current_position = ik
+            #should only need to give end position because velocity is linear
+            seed = self.current_position if self.current_position is not None else self.ik
+            self.ik = self.my_chain.inverse_kinematics(
+                target_position, target_orientation, orientation_mode="all", initial_position=seed
+            )
 
             msg = JointState()
-            msg.position = ik.tolist()
-            print("Joint Angles: ", list(map(lambda r:math.degrees(r),ik.tolist())))
+            msg.position = self.ik[1:7].tolist()  #get rid of dummy link
+            print("Joint Angles: ", list(map(lambda r:math.degrees(r),self.ik[1:7].tolist())))
             self.publisher_.publish(msg)    
 
         else:  #move in xyz space, assume constant rotation
-            
+            print("not in joint space mode, doing nothing. pls toggle to joitn space mode with command: ros2 param set /ik joint_space true")
 
 
-    # def timer_callback(self):
-    #     target_position = [ 0.2, .2, 0.2]
-    #     r = R.from_euler('yz', [-90,45], degrees=True)
-    #     target_orientation = r.as_matrix()
-    #     ik = self.my_chain.inverse_kinematics(target_position, target_orientation, orientation_mode="all", initial_position=self.old_position)
-    #     self.old_position = ik
+    def xyz_targ_callback(self, msg):
+        if len(msg.data) != 3:
+            print("invalid target position, should be 3 element XYZ")
+            return
 
-    #     msg = JointState()
-    #     msg.position = ik.tolist()
-    #     print("Joint Angles: ", list(map(lambda r:math.degrees(r),ik.tolist())))
-    #     self.publisher_.publish(msg)
+        target_position = msg.data[:3]
+        self.joint_space = self.get_parameter("joint_space").value
+        if self.joint_space:
+            print("not in xyz mode, doing nothing. pls toggle to cartesian mode with command: ros2 param set /ik joint_space false")
+            return
+
+        seed = self.current_position if self.current_position is not None else self.ik
+        # Current orientation from FK at seed pose (4x4); IK wants rotation matrix for tip
+        fk = self.my_chain.forward_kinematics(seed)
+        target_orientation = fk[:3, :3]
+
+        self.ik = self.my_chain.inverse_kinematics(
+            target_position, target_orientation, orientation_mode="all", initial_position=seed
+        )
+
+        out = JointState()
+        out.position = [float(x) for x in self.ik[1:7]]
+        print("Joint Angles: ", list(map(lambda r: math.degrees(r), self.ik[1:7].tolist())))
+        self.publisher_.publish(out)
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -87,39 +112,6 @@ def main(args=None):
 if __name__ == '__main__':
     main()
 
-
-# # ax = plt.figure().add_subplot(111, projection='3d')
-# fig, ax = plot_utils.init_3d_figure()
-# fig.set_figheight(9)  
-# fig.set_figwidth(13)  
-# my_chain.plot(ik, ax, target=target_position)
-
-# plt.xlim(-0.4, 0.4)
-# plt.ylim(-0.4, 0.4)
-# ax.set_zlim(0, 0.4)
-# # Equal axis scale so the robot is not stretched (matplotlib >= 3.3)
-
-# plt.show()
-
-# def doIK():
-#     global ik
-#     old_position= ik.copy()
-#     ik = my_chain.inverse_kinematics(target_position, target_orientation, orientation_mode="Z", initial_position=old_position)
-
-# def updatePlot():
-#     ax.clear()
-#     my_chain.plot(ik, ax, target=target_position)
-#     plt.xlim(-0.5, 0.5)
-#     plt.ylim(-0.5, 0.5)
-#     ax.set_zlim(0, 0.6)
-#     fig.canvas.draw()
-#     fig.canvas.flush_events()
-    
-# def move(x,y,z):
-#     global target_position
-#     target_position = [x,y,z]
-#     doIK()
-#     updatePlot()
 
 
 # #TODO: Add home position

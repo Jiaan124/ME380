@@ -1,11 +1,12 @@
 # ROS2 Humble with desktop (GUI) support for ME380
 FROM ros:humble-ros-base
 
-# Install desktop packages for RViz, Qt, and X11 GUI apps
+# Install desktop packages for RViz, Qt, X11 GUI apps, and xacro
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-humble-rviz2 \
     ros-humble-robot-state-publisher \
     ros-humble-joint-state-publisher-gui \
+    ros-humble-xacro \
     libxcb-xinerama0 \
     libxkbcommon-x11-0 \
     libxcb-icccm4 \
@@ -17,12 +18,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     x11-apps \
     && rm -rf /var/lib/apt/lists/*
 
-# Optional: dev tools
+# Optional: dev tools + basic networking (ip, ping)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
+    iproute2 \
+    iputils-ping \
     python3-pip \
     python3-colcon-common-extensions \
     && rm -rf /var/lib/apt/lists/*
+
+# Python deps for ik.py (inverse kinematics)
+RUN pip3 install --no-cache-dir ikpy
 
 # Source ROS2 in shell
 RUN echo "source /opt/ros/humble/setup.bash" >> /etc/bash.bashrc

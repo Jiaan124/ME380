@@ -23,6 +23,11 @@ Joint mapping (JointState.position array only; names are ignored):
   position[4], position[5] -> differential servo angles (rad)
   position[6] -> gripper (0 = open, >0.5 = closed)
   This robot always publishes 7 values in JointState.position.
+
+Parameters:
+  motion_velocity — Scale factor for how fast steppers and differential servos move
+    relative to the configured maxima (1.0 = default/nominal, 0.5 = half speed, etc.).
+  max_steps_per_sec — Step rate at motion_velocity == 1.0 (steps/s per axis, pacing cap).
 """
 
 import math
@@ -69,10 +74,16 @@ GPIO_PARAMS = {
     "gpio_j2_dir": 23,
     "gpio_j3_step": 24,
     "gpio_j3_dir": 25,
+    "gpio_j4_step": 5,
+    "gpio_j4_dir": 6,
     "gpio_servo_a": 12,
     "gpio_servo_b": 13,
     "gpio_servo_ee": 18,
 }
+
+# Clamp motion_velocity to avoid div-by-zero or absurd rates
+_MOTION_VELOCITY_MIN = 0.01
+_MOTION_VELOCITY_MAX = 10.0
 def _angle_deg_to_pulse_us(angle_deg: float) -> float:
     """Map servo angle in degrees (0–180) to pulse width us (500–2500), like Arduino Servo library."""
     return 500.0 + angle_deg * (2000.0 / 180.0)
@@ -88,6 +99,8 @@ class DriverNode(Node):
             "joint_state_topic": "joint_states",
             "max_stepper_delta_per_msg": 360.0,
             "max_steps_per_sec": 2000.0,
+            # Scales stepper steps/s and differential servo slew (1.0 = nominal)
+            "motion_velocity": 1.0,
             "gear_ratio_j1": GEAR_RATIO_J1,
             "gear_ratio_j2": GEAR_RATIO_J2,
             "gear_ratio_j3": GEAR_RATIO_J3,
@@ -103,7 +116,10 @@ class DriverNode(Node):
         self.joint_state_topic = p("joint_state_topic")
         self.max_stepper_delta = p("max_stepper_delta_per_msg")
         self.max_steps_per_sec = p("max_steps_per_sec")
+        self._motion_velocity = self._clamp_motion_velocity(p("motion_velocity"))
         self.gear_ratios = [p("gear_ratio_j1"), p("gear_ratio_j2"), p("gear_ratio_j3"), p("gear_ratio_j4")]
+
+        self.add_on_set_parameters_callback(self._on_parameters_changed)
 
         self._pending_steps = [0, 0, 0, 0]
         self._last_step_time = [0.0, 0.0, 0.0, 0.0]
@@ -139,6 +155,21 @@ class DriverNode(Node):
             10,
         )
 
+    @staticmethod
+    def _clamp_motion_velocity(v: float) -> float:
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            x = 1.0
+        return max(_MOTION_VELOCITY_MIN, min(_MOTION_VELOCITY_MAX, x))
+
+    def _on_parameters_changed(self, params):
+        from rcl_interfaces.msg import SetParametersResult
+
+        for param in params:
+            if param.name == "motion_velocity":
+                self._motion_velocity = self._clamp_motion_velocity(param.value)
+        return SetParametersResult(successful=True)
 
     def _setup_gpio(self):
         for p in [self.gpio_enable] + self.step_pins + self.dir_pins:
@@ -159,8 +190,11 @@ class DriverNode(Node):
         self._pi.write(self.step_pins[axis], 0)
 
     def _stepper_loop(self):
-        min_interval = 1.0 / self.max_steps_per_sec
         while not self._shutdown:
+            # Effective step rate = nominal * motion_velocity
+            v = self._motion_velocity
+            rate = max(1e-6, float(self.max_steps_per_sec) * v)
+            min_interval = 1.0 / rate
             now = time.monotonic()
             with self._step_lock:
                 for axis in range(4):
@@ -192,7 +226,7 @@ class DriverNode(Node):
         if now - self._last_servo_update < SERVO_UPDATE_PERIOD_S:
             return
         self._last_servo_update = now
-        step_us = SERVO_SPEED_US_PER_SEC * SERVO_UPDATE_PERIOD_S
+        step_us = SERVO_SPEED_US_PER_SEC * SERVO_UPDATE_PERIOD_S * self._motion_velocity
         self._current_pwm_a = self._step_toward(self._current_pwm_a, self._target_pwm_a, step_us)
         self._current_pwm_b = self._step_toward(self._current_pwm_b, self._target_pwm_b, step_us)
         cur_a = int(round(self._current_pwm_a))

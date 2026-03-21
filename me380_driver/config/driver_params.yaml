@@ -1,0 +1,7 @@
+# Parameters for driver_node_py (see scripts/driver_node_py.py)
+driver_node_py:
+  ros__parameters:
+    motion_velocity: 1.0
+    max_steps_per_sec: 2000.0
+    max_stepper_delta_per_msg: 360.0
+    joint_state_topic: "joint_states"

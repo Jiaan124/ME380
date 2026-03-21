@@ -3,10 +3,12 @@ project(me380_driver)
 
 find_package(ament_cmake REQUIRED)
 
-install(PROGRAMS scripts/driver_node_py.py
+install(PROGRAMS
+  scripts/driver_node_py.py
+  scripts/ik.py
   DESTINATION lib/${PROJECT_NAME})
 
-install(DIRECTORY launch urdf
+install(DIRECTORY launch urdf config
   DESTINATION share/${PROJECT_NAME}
 )
 
