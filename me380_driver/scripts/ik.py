@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
+import os
+
 import ikpy.chain
 import numpy as np
 import ikpy.utils.plot as plot_utils
 # import matplotlib.pyplot as plt
 import math
+from ament_index_python.packages import get_package_share_directory
 from scipy.spatial.transform import Rotation as R
 import rclpy
 from rclpy.node import Node
@@ -15,10 +18,17 @@ Takes in final target position x y z and orientation and creates a joint state a
 '''
 
 
+def _default_urdf_path() -> str:
+    """Installed URDF: share/me380_driver/urdf/me380_robot.urdf (after colcon build + source)."""
+    pkg_share = get_package_share_directory("me380_driver")
+    return os.path.join(pkg_share, "urdf", "me380_robot.urdf")
+
+
 class ikNode(Node):
     def __init__(self):
         super().__init__("ik")
-        self.declare_parameter("filepath","me380_robot.urdf" )
+        # Override with absolute path if needed; default is package share URDF
+        self.declare_parameter("filepath", _default_urdf_path())
         self.filepath = self.get_parameter("filepath").value
         self.publisher_ = self.create_publisher(JointState, "joint_angles", 10) #message type, topic name, buffer size
         self.sub = self.create_subscription(  #take in x, y, z and euler angles? or should it take in x y z and rotation matrix?
@@ -48,7 +58,11 @@ class ikNode(Node):
         self.my_chain = ikpy.chain.Chain.from_urdf_file(self.filepath, active_links_mask=[False, True, True, True, True, True, True, False])
         #needed to have correct arm orientation when solving 2.64 rad = 151 deg, 1.57 rad = 90
         self.current_position = None
-        self.ik = [0, 0, 2.64, 1.571, 0.0, 1.0, 0, 0] 
+        self.ik = [0, 0, 2.64, 1.571, 0.0, 1.0, 0, 0]
+
+    def _stamp_joint_state(self, js: JointState) -> None:
+        """Set header.stamp to current ROS time (for joint_angles subscribers)."""
+        js.header.stamp = self.get_clock().now().to_msg()
 
     def actual_state_callback(self, msg):
         # pad with extra 0 at beginning and end so ik can solve
@@ -67,10 +81,11 @@ class ikNode(Node):
                 target_position, target_orientation, orientation_mode="all", initial_position=seed
             )
 
-            msg = JointState()
-            msg.position = self.ik[1:7].tolist()  #get rid of dummy link
-            print("Joint Angles: ", list(map(lambda r:math.degrees(r),self.ik[1:7].tolist())))
-            self.publisher_.publish(msg)    
+            out = JointState()
+            self._stamp_joint_state(out)
+            out.position = self.ik[1:7].tolist()  # get rid of dummy link
+            # print("Joint Angles: ", list(map(lambda r: math.degrees(r), self.ik[1:7].tolist())))
+            self.publisher_.publish(out)
 
         else:  #move in xyz space, assume constant rotation
             print("not in joint space mode, doing nothing. pls toggle to joitn space mode with command: ros2 param set /ik joint_space true")
@@ -97,6 +112,7 @@ class ikNode(Node):
         )
 
         out = JointState()
+        self._stamp_joint_state(out)
         out.position = [float(x) for x in self.ik[1:7]]
         print("Joint Angles: ", list(map(lambda r: math.degrees(r), self.ik[1:7].tolist())))
         self.publisher_.publish(out)

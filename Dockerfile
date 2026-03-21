@@ -27,8 +27,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-colcon-common-extensions \
     && rm -rf /var/lib/apt/lists/*
 
-# Python deps for ik.py (inverse kinematics)
-RUN pip3 install --no-cache-dir ikpy
+# Python deps for ik.py (inverse kinematics) and plotting
+RUN pip3 install --no-cache-dir ikpy matplotlib
 
 # Source ROS2 in shell
 RUN echo "source /opt/ros/humble/setup.bash" >> /etc/bash.bashrc
