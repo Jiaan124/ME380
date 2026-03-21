@@ -1,7 +1,12 @@
+docker compose build
+docker compose up -d
+docker compose exec me380 bash
+cd /me380 && colcon build --packages-select me380_driver && source install/setup.bash
+colcon build --packages-select me380_driver --symlink-install
 
 
 ros2 topic pub -1 /joint_states sensor_msgs/msg/JointState "{header: {frame_id: ''}, position: [0.4, 0.4, 0.4, 0.0, 0.0, 0.0, 0.0]}"
 ros2 topic pub -1 /joint_states sensor_msgs/msg/JointState "{header: {frame_id: ''}, position: [-0.4, -0.4, -0.4, 0.0, 0.0, 0.0, 0.0]}"
 
 ros2 launch me380_driver driver_python.launch.py
-os2 run xacro xacro me380_driver/urdf/me380_robot.urdf.xacro -o me380_driver/urdf/me380_robot.urdf
+ros2 run xacro xacro me380_driver/urdf/me380_robot.urdf.xacro -o me380_driver/urdf/me380_robot.urdf
