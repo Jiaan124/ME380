@@ -70,7 +70,7 @@ EE_CLOSE_DEG = 100.0
 
 STEP_PULSE_US = 5
 STEP_PULSE_S = STEP_PULSE_US / 1e6
-# Match ik.cpp (ESP32/Arduino): 20 ms update, step toward target at 400 us/s. Hardware timers there give stable PWM; we match the logic.
+# ESP32/Arduino-style servo timing: 20 ms update, ramp toward target at 400 us/s (stable integer PWM writes).
 SERVO_SPEED_US_PER_SEC = 400.0
 SERVO_UPDATE_PERIOD_S = 0.02
 
@@ -279,13 +279,13 @@ class DriverNode(Node):
         self._stepper_thread.start()
 
     def _step_toward(self, current: float, target: float, step: float) -> float:
-        """Match ik.cpp stepToward: move current toward target by at most step."""
+        """Move current toward target by at most step (servo PWM ramp)."""
         if abs(target - current) <= step:
             return target
         return current + (step if target > current else -step)
 
     def _servo_tick(self):
-        """Match ik.cpp updateServos(): every UPDATE_PERIOD_S, step current toward target and write integer us (stable values)."""
+        """Every UPDATE_PERIOD_S, ramp current PWM toward target and write integer µs when changed."""
         if not self._pi.connected:
             return
         now = time.monotonic()
@@ -309,7 +309,7 @@ class DriverNode(Node):
         self._servo_timer = self.create_timer(SERVO_UPDATE_PERIOD_S, self._servo_tick)
 
     def _move_differential(self, angle4_deg: float, angle5_deg: float):
-        """Set target PWM for differential servos (ik.cpp: targetPwmA/B). Smoothing happens in _servo_tick."""
+        """Set target PWM for differential servos; smoothing happens in _servo_tick."""
         angle_a = SERVO_GEAR_REDUCTION * (angle4_deg + angle5_deg)
         angle_b = SERVO_GEAR_REDUCTION * (-angle4_deg + angle5_deg)
         angle_a = max(-SERVO_RANGE_DEG, min(SERVO_RANGE_DEG, angle_a))
@@ -355,7 +355,7 @@ class DriverNode(Node):
             self._pending_steps[2] += self._steps_for_delta_deg(2, d3)
             self._pending_steps[3] += self._steps_for_delta_deg(3, d4)
 
-        # Differential servos: set targets; _servo_tick steps toward them (same logic as ik.cpp)
+        # Differential servos: set targets; _servo_tick ramps PWM toward them
         self._move_differential(diff_a_deg, diff_b_deg)
 
         # End effector
