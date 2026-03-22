@@ -28,6 +28,8 @@ Parameters:
   motion_velocity — Scale factor for how fast steppers and differential servos move
     relative to the configured maxima (1.0 = default/nominal, 0.5 = half speed, etc.).
   max_steps_per_sec — Step rate at motion_velocity == 1.0 (steps/s per axis, pacing cap).
+  joint_feedback_topic — Open-loop JointState published at 50 Hz (step integration + PWM→diff joints).
+  Service zero_steppers — ZeroSteppers.srv: zeros open-loop _joint_feedback_rad; response reports success.
 """
 
 import math
@@ -39,10 +41,16 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 
+from me380_driver.srv import ZeroSteppers
+
 import pigpio
 
 
 RAD_TO_DEG = 180.0 / math.pi
+DEG_TO_RAD = math.pi / 180.0
+
+# Open-loop joint feedback publisher rate (hybrid: incremental updates + periodic snapshot)
+JOINT_FEEDBACK_PERIOD_S = 0.02  # 50 Hz
 
 # From esp32_driver.cpp
 STEPS_PER_REV = 200.0 * 16.0  # 200 steps/rev, 16 microstepping
@@ -89,6 +97,18 @@ def _angle_deg_to_pulse_us(angle_deg: float) -> float:
     return 500.0 + angle_deg * (2000.0 / 180.0)
 
 
+def _pwm_pair_to_diff_joints_deg(pwm_a: float, pwm_b: float):
+    """Inverse of _move_differential: PWM A/B → differential joint angles (deg)."""
+    angle_a = (pwm_a - PWM_CENTER) / US_PER_DEG
+    angle_b = (pwm_b - PWM_CENTER) / US_PER_DEG
+    k = SERVO_GEAR_REDUCTION
+    if abs(k) < 1e-9:
+        return 0.0, 0.0
+    angle4_deg = (angle_a - angle_b) / (2.0 * k)
+    angle5_deg = (angle_a + angle_b) / (2.0 * k)
+    return angle4_deg, angle5_deg
+
+
 class DriverNode(Node):
     def __init__(self):
         super().__init__("driver_node_py")
@@ -105,6 +125,7 @@ class DriverNode(Node):
             "gear_ratio_j2": GEAR_RATIO_J2,
             "gear_ratio_j3": GEAR_RATIO_J3,
             "gear_ratio_j4": GEAR_RATIO_J4,
+            "joint_feedback_topic": "actual_joint_position",
         }.items():
             self.declare_parameter(name, default)
 
@@ -118,9 +139,12 @@ class DriverNode(Node):
         self.max_steps_per_sec = p("max_steps_per_sec")
         self._motion_velocity = self._clamp_motion_velocity(p("motion_velocity"))
         self.gear_ratios = [p("gear_ratio_j1"), p("gear_ratio_j2"), p("gear_ratio_j3"), p("gear_ratio_j4")]
+        self._joint_feedback_topic = p("joint_feedback_topic")
 
         self.add_on_set_parameters_callback(self._on_parameters_changed)
-
+        self._feedback_lock = threading.Lock()
+        # Open-loop estimate: 4 stepper joints (rad) + 2 diff servos (rad) + gripper (0=open, 1=closed style)
+        self._joint_feedback_rad = [0.0] * 7
         self._pending_steps = [0, 0, 0, 0]
         self._last_step_time = [0.0, 0.0, 0.0, 0.0]
         self._step_lock = threading.Lock()
@@ -133,6 +157,7 @@ class DriverNode(Node):
         self._last_servo_update = 0.0
         self._ee_closed = False
         self._last_j_deg = [0.0, 0.0, 0.0, 0.0]
+        self._current_pwm_ee = float(_angle_deg_to_pulse_us(EE_OPEN_DEG))
 
         self._pi = pigpio.pi()
         self._stepper_thread = None
@@ -145,8 +170,23 @@ class DriverNode(Node):
 
 
         self._setup_gpio()
+        self._sync_servo_joints_feedback_from_pwm()
         self._start_stepper_thread()
         self._start_servo_update_timer()
+
+        self._feedback_pub = self.create_publisher(JointState, self._joint_feedback_topic, 10)
+        self._feedback_timer = self.create_timer(JOINT_FEEDBACK_PERIOD_S, self._publish_joint_feedback)
+        self.get_logger().info(
+            "Publishing open-loop joint feedback at %.0f Hz on '%s'"
+            % (1.0 / JOINT_FEEDBACK_PERIOD_S, self._joint_feedback_topic)
+        )
+
+        self._zero_steppers_srv = self.create_service(
+            ZeroSteppers,
+            "zero_steppers",
+            self._zero_steppers_callback,
+        )
+        self.get_logger().info("Service ready: zero_steppers (me380_driver/srv/ZeroSteppers)")
 
         self.sub = self.create_subscription(
             JointState,
@@ -171,6 +211,16 @@ class DriverNode(Node):
                 self._motion_velocity = self._clamp_motion_velocity(param.value)
         return SetParametersResult(successful=True)
 
+    def _zero_steppers_callback(self, request, response):
+        """ROS service: zero open-loop joint feedback (does not move hardware or clear step queue)."""
+        del request  # empty
+        with self._feedback_lock:
+            self._joint_feedback_rad = [0.0] * 7
+        response.success = True
+        response.message = "joint feedback estimate zeroed (7 floats)"
+        self.get_logger().info("zero_steppers: %s" % response.message)
+        return response
+
     def _setup_gpio(self):
         for p in [self.gpio_enable] + self.step_pins + self.dir_pins:
             self._pi.set_mode(p, pigpio.OUTPUT)
@@ -182,6 +232,19 @@ class DriverNode(Node):
 
     def _steps_for_delta_deg(self, axis: int, delta_deg: float) -> int:
         return int(round(delta_deg * STEPS_PER_REV * self.gear_ratios[axis] / 360.0))
+
+    def _step_delta_rad(self, axis: int, direction: int) -> float:
+        """Joint angle change (rad) for one full step in +direction on this axis."""
+        gr = max(self.gear_ratios[axis], 1e-9)
+        joint_deg_per_step = 360.0 / (STEPS_PER_REV * gr)
+        return direction * joint_deg_per_step * DEG_TO_RAD
+
+    def _sync_servo_joints_feedback_from_pwm(self) -> None:
+        """Update feedback indices 4–5 from current differential PWM (under _feedback_lock)."""
+        d4_deg, d5_deg = _pwm_pair_to_diff_joints_deg(self._current_pwm_a, self._current_pwm_b)
+        with self._feedback_lock:
+            self._joint_feedback_rad[4] = d4_deg * DEG_TO_RAD
+            self._joint_feedback_rad[5] = d5_deg * DEG_TO_RAD
 
     def _do_one_step(self, axis: int, direction: int):
         self._pi.write(self.dir_pins[axis], 1 if direction > 0 else 0)
@@ -206,6 +269,9 @@ class DriverNode(Node):
                     self._do_one_step(axis, direction)
                     self._pending_steps[axis] -= direction
                     self._last_step_time[axis] = now
+                    dtheta = self._step_delta_rad(axis, direction)
+                    with self._feedback_lock:
+                        self._joint_feedback_rad[axis] += dtheta
             time.sleep(0.0001)
 
     def _start_stepper_thread(self):
@@ -237,6 +303,7 @@ class DriverNode(Node):
         if cur_b != self._last_written_pwm_b:
             self._last_written_pwm_b = cur_b
             self._pi.set_servo_pulsewidth(self.gpio_servo_b, cur_b)
+        self._sync_servo_joints_feedback_from_pwm()
 
     def _start_servo_update_timer(self):
         self._servo_timer = self.create_timer(SERVO_UPDATE_PERIOD_S, self._servo_tick)
@@ -249,6 +316,15 @@ class DriverNode(Node):
         angle_b = max(-SERVO_RANGE_DEG, min(SERVO_RANGE_DEG, angle_b))
         self._target_pwm_a = int(max(PWM_MIN, min(PWM_MAX, PWM_CENTER + angle_a * US_PER_DEG)))
         self._target_pwm_b = int(max(PWM_MIN, min(PWM_MAX, PWM_CENTER + angle_b * US_PER_DEG)))
+
+    def _publish_joint_feedback(self) -> None:
+        """50 Hz: snapshot open-loop joint estimate and publish (executor thread)."""
+        with self._feedback_lock:
+            positions = [float(x) for x in self._joint_feedback_rad]
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.position = positions
+        self._feedback_pub.publish(msg)
 
     def _on_joint_state(self, msg):
         position = list(msg.position)
@@ -288,10 +364,16 @@ class DriverNode(Node):
             self._ee_closed = closed
             angle = EE_CLOSE_DEG if closed else EE_OPEN_DEG
             pulse_us = int(max(PWM_MIN, min(PWM_MAX, _angle_deg_to_pulse_us(angle))))
+            self._current_pwm_ee = float(pulse_us)
             self._pi.set_servo_pulsewidth(self.gpio_servo_ee, pulse_us)
+            with self._feedback_lock:
+                self._joint_feedback_rad[6] = 1.0 if closed else 0.0
 
     def destroy_node(self, *args, **kwargs):
         self._shutdown = True
+        if self._feedback_timer is not None:
+            self._feedback_timer.cancel()
+            self._feedback_timer = None
         if self._servo_timer is not None:
             self._servo_timer.cancel()
             self._servo_timer = None

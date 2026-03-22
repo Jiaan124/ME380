@@ -1,0 +1,4 @@
+# Empty request — zeros open-loop _joint_feedback_rad (7 joints)
+---
+bool success
+string message

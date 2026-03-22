@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch the Python driver node."""
+"""Launch the Python GPIO driver and IK nodes."""
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -19,7 +19,7 @@ def generate_launch_description():
         description='Scale for stepper + differential servo speed (1.0 = nominal)',
     )
 
-    node = Node(
+    driver_node = Node(
         package='me380_driver',
         executable='driver_node_py.py',
         name='driver_node_py',
@@ -35,4 +35,11 @@ def generate_launch_description():
         ],
     )
 
-    return LaunchDescription([motion_velocity_arg, node])
+    ik_node = Node(
+        package='me380_driver',
+        executable='ik.py',
+        name='ik',
+        output='screen',
+    )
+
+    return LaunchDescription([motion_velocity_arg, driver_node, ik_node])
