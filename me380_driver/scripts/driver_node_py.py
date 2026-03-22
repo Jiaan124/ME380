@@ -29,7 +29,7 @@ Parameters:
     relative to the configured maxima (1.0 = default/nominal, 0.5 = half speed, etc.).
   max_steps_per_sec — Step rate at motion_velocity == 1.0 (steps/s per axis, pacing cap).
   joint_feedback_topic — Open-loop JointState published at 50 Hz (step integration + PWM→diff joints).
-  Service zero_steppers — ZeroSteppers.srv: zeros open-loop _joint_feedback_rad; response reports success.
+  Service zero_steppers — std_srvs/Trigger: zeros open-loop _joint_feedback_rad; response success + message.
 """
 
 import math
@@ -40,8 +40,7 @@ import time
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-
-from me380_driver.srv import ZeroSteppers
+from std_srvs.srv import Trigger
 
 import pigpio
 
@@ -55,9 +54,9 @@ JOINT_FEEDBACK_PERIOD_S = 0.02  # 50 Hz
 # From esp32_driver.cpp
 STEPS_PER_REV = 200.0 * 16.0  # 200 steps/rev, 16 microstepping
 GEAR_RATIO_J1 = 5.0  #base
-GEAR_RATIO_J2 = 56.25  #shoulder
-GEAR_RATIO_J3 = 34.0  #elbow
-GEAR_RATIO_J4 = 20.0 #wrist?
+GEAR_RATIO_J2 = 58.5  #shoulder
+GEAR_RATIO_J3 = 52  #elbow
+GEAR_RATIO_J4 = 4.0 #wrist?
 
 SERVO_GEAR_REDUCTION = 3.0 / 4.0
 PWM_CENTER = 1500
@@ -182,11 +181,11 @@ class DriverNode(Node):
         )
 
         self._zero_steppers_srv = self.create_service(
-            ZeroSteppers,
+            Trigger,
             "zero_steppers",
             self._zero_steppers_callback,
         )
-        self.get_logger().info("Service ready: zero_steppers (me380_driver/srv/ZeroSteppers)")
+        self.get_logger().info("Service ready: zero_steppers (std_srvs/srv/Trigger)")
 
         self.sub = self.create_subscription(
             JointState,
