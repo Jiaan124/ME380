@@ -239,8 +239,8 @@ class DriverNode(Node):
                         * self.gear_ratios[axis]
                         / (2.0 * math.pi)
                     )
-                    # min_interval = 1.0 / rate
-                    min_interval = 0.0002
+                    min_interval = 1.0 / rate
+                    # min_interval = 0.0001
                     if now - self._last_step_time[axis] < min_interval:
                         continue
                     direction = 1 if self._pending_steps[axis] > 0 else -1
@@ -260,7 +260,7 @@ class DriverNode(Node):
                     )
                     with self._feedback_lock:
                         self._joint_feedback_rad[axis] += dtheta
-            # time.sleep(0.000001)
+            time.sleep(0.000001)
 
     def _start_stepper_thread(self):
         self._stepper_thread = threading.Thread(target=self._stepper_loop, daemon=True)

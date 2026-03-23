@@ -24,9 +24,9 @@ except ImportError:
 # ----- Edit 
 # these -----
 NUM_STEPS = 4000
-TIME_BETWEEN_STEPS_MS = 0.5  # seconds between steps (0.01 = 100 steps/sec)
-STEP_PIN = 17
-DIR_PIN = 27
+TIME_BETWEEN_STEPS_MS = 0.2  # seconds between steps (0.01 = 100 steps/sec)
+STEP_PIN = 22
+DIR_PIN = 23
 STEP_PULSE = 0.0005
 
 # GPIO_J1_STEP, GPIO_J1_DIR = 17, 27
