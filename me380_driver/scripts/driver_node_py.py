@@ -75,7 +75,7 @@ STEPPER_MICROSTEPPING_LIST = [16, 16, 16, 16]
 GEAR_RATIO = [GEAR_RATIO_J1, GEAR_RATIO_J2, GEAR_RATIO_J3, GEAR_RATIO_J4]
 
 # Max |joint velocity| at output (rad/s): [J1..J4 steppers, J5 diff, J6 diff, unused index 6]
-JOINT_MAX_VELOCITY_RAD_S = [0.5, 0.3, 0.3, 0.5, 0.5, 0.5, 1.0]
+JOINT_MAX_VELOCITY_RAD_S = [0.5, 1, 1, 0.5, 0.5, 0.5, 1.0]
 
 SERVO_GEAR_REDUCTION = 3.0 / 4.0
 PWM_CENTER = 1500
@@ -117,17 +117,12 @@ class DriverNode(Node):
 
         self._motor_full_step_deg = float(MOTOR_FULL_STEP_DEG)
         self._stepper_microstepping = STEPPER_MICROSTEPPING
-        self._steps_per_motor_rev = (
-            360.0 / self._motor_full_step_deg
-        ) * float(self._stepper_microstepping)
+        self._stepper_microstepping_list = STEPPER_MICROSTEPPING_LIST
+        self._steps_per_motor_rev = 200* self._stepper_microstepping #default step/rev
+        self._steps_per_motor_rev_list = 200* self._stepper_microstepping_list #default step/rev
 
-        _jseq = list(JOINT_MAX_VELOCITY_RAD_S)
-        _jout = [float(x) for x in _jseq[:7]]
-        while len(_jout) < 7:
-            _jout.append(1.0)
-        self._joint_max_vel_rad_s = [
-            max(0.0, min(_JOINT_MAX_VEL_RAD_S_CEIL, abs(x))) for x in _jout
-        ]
+
+        self._joint_max_vel_rad_s = JOINT_MAX_VELOCITY_RAD_S
 
         self._feedback_lock = threading.Lock()
         self._joint_feedback_rad = [0.0] * 7
@@ -231,21 +226,21 @@ class DriverNode(Node):
             self._joint_feedback_rad[5] = DIFF_JOINT6_SIGN * d5_deg * DEG_TO_RAD
 
     def _stepper_loop(self):
-        """Background thread: rate-limited stepping, GPIO pulse, joint-angle feedback update."""
+        """Background thread: stepping, GPIO pulse, joint-angle feedback update."""
         while not self._shutdown:
             now = time.monotonic()
             with self._step_lock:
                 for axis in range(4):
                     if self._pending_steps[axis] == 0:
                         continue
-                    omega = max(self._joint_max_vel_rad_s[axis], 1e-9)
+                    omega = self._joint_max_vel_rad_s[axis]
                     rate = omega * (
-                        self._steps_per_motor_rev
+                        self._steps_per_motor_rev_list[axis]
                         * self.gear_ratios[axis]
                         / (2.0 * math.pi)
                     )
-                    rate = max(1e-6, rate)
-                    min_interval = 1.0 / rate
+                    # min_interval = 1.0 / rate
+                    min_interval = 0.0002
                     if now - self._last_step_time[axis] < min_interval:
                         continue
                     direction = 1 if self._pending_steps[axis] > 0 else -1
@@ -255,8 +250,8 @@ class DriverNode(Node):
                     self._pi.write(self.step_pins[axis], 0)
                     self._pending_steps[axis] -= direction
                     self._last_step_time[axis] = now
-                    gr = max(self.gear_ratios[axis], 1e-9)
-                    joint_deg_per_step = 360.0 / (self._steps_per_motor_rev * gr)
+                    gr = self.gear_ratios[axis]
+                    joint_deg_per_step = 360.0 / (self._steps_per_motor_rev_list[axis] * gr)
                     dtheta = (
                         direction
                         * joint_deg_per_step
@@ -265,7 +260,7 @@ class DriverNode(Node):
                     )
                     with self._feedback_lock:
                         self._joint_feedback_rad[axis] += dtheta
-            time.sleep(0.00001)
+            # time.sleep(0.000001)
 
     def _start_stepper_thread(self):
         self._stepper_thread = threading.Thread(target=self._stepper_loop, daemon=True)
