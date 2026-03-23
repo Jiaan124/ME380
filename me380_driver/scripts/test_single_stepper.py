@@ -21,12 +21,18 @@ except ImportError:
     HAS_GPIO = False
     GPIO = None
 
-# ----- Edit these -----
-NUM_STEPS = 300
-TIME_BETWEEN_STEPS_S = 0.1  # seconds between steps (0.01 = 100 steps/sec)
+# ----- Edit 
+# these -----
+NUM_STEPS = 4000
+TIME_BETWEEN_STEPS_MS = 0.5  # seconds between steps (0.01 = 100 steps/sec)
 STEP_PIN = 17
 DIR_PIN = 27
-STEP_PULSE = 0.002
+STEP_PULSE = 0.0005
+
+# GPIO_J1_STEP, GPIO_J1_DIR = 17, 27
+# GPIO_J2_STEP, GPIO_J2_DIR = 22, 23
+# GPIO_J3_STEP, GPIO_J3_DIR = 24, 25
+# GPIO_J4_STEP, GPIO_J4_DIR = 5, 6
 # ----------------------
 
 
@@ -49,12 +55,12 @@ def main():
         GPIO.output(DIR_PIN, GPIO.HIGH)
         for _ in range(NUM_STEPS):
             GPIO.output(STEP_PIN, GPIO.HIGH)
-            print("pulsed high")
-            time.sleep(STEP_PULSE)
+            # print("pulsed high")
+            time.sleep(STEP_PULSE/1000)
             GPIO.output(STEP_PIN, GPIO.LOW)
-            print("pulsed low")
+            # print("pulsed low")
 
-            time.sleep(STEP_PULSE)
+            time.sleep(TIME_BETWEEN_STEPS_MS/1000)
 
         # Back (dir=0)
         if use_gpio:
@@ -62,9 +68,9 @@ def main():
         for _ in range(NUM_STEPS):
             if use_gpio:
                 GPIO.output(STEP_PIN, GPIO.HIGH)
-                time.sleep(STEP_PULSE)
+                time.sleep(STEP_PULSE/1000)
                 GPIO.output(STEP_PIN, GPIO.LOW)
-            time.sleep(STEP_PULSE)
+            time.sleep(TIME_BETWEEN_STEPS_MS/1000)
 
         print("Done.")
     finally:

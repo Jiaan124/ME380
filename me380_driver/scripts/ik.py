@@ -30,7 +30,7 @@ class ikNode(Node):
         # Override with absolute path if needed; default is package share URDF
         self.declare_parameter("filepath", _default_urdf_path())
         self.filepath = self.get_parameter("filepath").value
-        self.publisher_ = self.create_publisher(JointState, "joint_angles", 10) #message type, topic name, buffer size
+        self.publisher_ = self.create_publisher(JointState, "joint_states", 10) #message type, topic name, buffer size
         self.sub = self.create_subscription(  #take in x, y, z and euler angles? or should it take in x y z and rotation matrix?
             Float64MultiArray,  #data type
             'target_position_joint_space', #topic name
@@ -58,7 +58,8 @@ class ikNode(Node):
         self.my_chain = ikpy.chain.Chain.from_urdf_file(self.filepath, active_links_mask=[False, True, True, True, True, True, True, False])
         #needed to have correct arm orientation when solving 2.64 rad = 151 deg, 1.57 rad = 90
         self.current_position = None
-        self.ik = [0, 0, 2.64, 1.571, 0.0, 1.0, 0, 0]
+        self.ik = [0, 0, 0.5, 0, 0.0, 0.0, 0, 0]
+        print("ik node running")
 
     def _stamp_joint_state(self, js: JointState) -> None:
         """Set header.stamp to current ROS time (for joint_angles subscribers)."""
@@ -66,7 +67,7 @@ class ikNode(Node):
 
     def actual_state_callback(self, msg):
         # pad with extra 0 at beginning and end so ik can solve
-        self.current_position = [0.0] + list(msg.position) + [0.0]
+        self.current_position = [0.0] + list(msg.position[:6]) + [0.0]
 
     def joint_targ_callback(self, msg):
         target_position = msg.data[:3]
@@ -78,13 +79,14 @@ class ikNode(Node):
             #should only need to give end position because velocity is linear
             seed = self.current_position if self.current_position is not None else self.ik
             self.ik = self.my_chain.inverse_kinematics(
-                target_position, target_orientation, orientation_mode="all", initial_position=seed
+                target_position, target_orientation, orientation_mode="all", initial_position=self.ik
             )
 
             out = JointState()
             self._stamp_joint_state(out)
             out.position = self.ik[1:7].tolist()  # get rid of dummy link
             # print("Joint Angles: ", list(map(lambda r: math.degrees(r), self.ik[1:7].tolist())))
+            out.position.append(0) #TODO: CHANGE THIS> THIS ONLY EXISTS BECAUSE IM LAZY TO DO GRIPPER
             self.publisher_.publish(out)
 
         else:  #move in xyz space, assume constant rotation

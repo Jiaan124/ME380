@@ -25,12 +25,8 @@ Joint mapping (JointState.position array only; names are ignored):
   position[6] -> gripper (0 = open, >0.5 = closed)
   This robot always publishes 7 values in JointState.position.
 
-Parameters:
-  motion_velocity — Scale factor for how fast steppers and differential servos move
-    relative to the configured maxima (1.0 = default/nominal, 0.5 = half speed, etc.).
-  max_steps_per_sec — Step rate at motion_velocity == 1.0 (steps/s per axis, pacing cap).
-  joint_feedback_topic — Open-loop JointState published at 50 Hz (step integration + PWM→diff joints).
-  Service zero_steppers — std_srvs/Trigger: zeros open-loop _joint_feedback_rad; response success + message.
+Tune GPIO, gear ratios, topics, stepper limits, and joint velocities via module constants below
+(no ROS parameters).
 """
 
 import math
@@ -49,15 +45,37 @@ import pigpio
 RAD_TO_DEG = 180.0 / math.pi
 DEG_TO_RAD = math.pi / 180.0
 
-# Open-loop joint feedback publisher rate (hybrid: incremental updates + periodic snapshot)
 JOINT_FEEDBACK_PERIOD_S = 0.02  # 50 Hz
 
-# From esp32_driver.cpp
-STEPS_PER_REV = 200.0 * 16.0  # 200 steps/rev, 16 microstepping
-GEAR_RATIO_J1 = 5.0  #base
-GEAR_RATIO_J2 = 58.5  #shoulder
-GEAR_RATIO_J3 = 52  #elbow
-GEAR_RATIO_J4 = 4.0 #wrist?
+# --- BCM GPIO (CNC shield) ---
+GPIO_ENABLE = 8
+GPIO_J1_STEP, GPIO_J1_DIR = 17, 27
+GPIO_J2_STEP, GPIO_J2_DIR = 22, 23
+GPIO_J3_STEP, GPIO_J3_DIR = 24, 25
+GPIO_J4_STEP, GPIO_J4_DIR = 5, 6
+GPIO_SERVO_A, GPIO_SERVO_B, GPIO_SERVO_EE = 12, 13, 18
+
+# --- Gear ratios (motor revolutions per joint revolution), J1..J4 ---
+GEAR_RATIO_J1 = 5.0
+GEAR_RATIO_J2 = 58.5
+GEAR_RATIO_J3 = 52.0
+GEAR_RATIO_J4 = 4.0
+
+
+
+# --- ROS topics ---
+JOINT_STATE_TOPIC = "joint_states"
+JOINT_FEEDBACK_TOPIC = "actual_joint_position"
+
+# --- Stepper command limits ---
+MAX_STEPPER_DELTA_PER_MSG = 360.0  # max |Δθ| (deg) per JointState message per stepper axis
+MOTOR_FULL_STEP_DEG = 1.8
+STEPPER_MICROSTEPPING = 16
+STEPPER_MICROSTEPPING_LIST = [16, 16, 16, 16]
+GEAR_RATIO = [GEAR_RATIO_J1, GEAR_RATIO_J2, GEAR_RATIO_J3, GEAR_RATIO_J4]
+
+# Max |joint velocity| at output (rad/s): [J1..J4 steppers, J5 diff, J6 diff, unused index 6]
+JOINT_MAX_VELOCITY_RAD_S = [0.5, 0.3, 0.3, 0.5, 0.5, 0.5, 1.0]
 
 SERVO_GEAR_REDUCTION = 3.0 / 4.0
 PWM_CENTER = 1500
@@ -72,82 +90,46 @@ STEP_PULSE_US = 5
 STEP_PULSE_S = STEP_PULSE_US / 1e6
 # Per-axis sign for step queue + feedback: +1 default, -1 = joint angle vs motor reversed (J2=Y, J4=A).
 STEPPER_JOINT_DIR_SIGN = (1, -1, 1, -1)
-# Joint 6 = JointState position[5] (second diff DOF). Joint 5 = position[4]. Flip only joint 6 vs servos.
 DIFF_JOINT6_SIGN = -1
 # ESP32/Arduino-style servo timing: 20 ms update, ramp toward target at 400 us/s (stable integer PWM writes).
 SERVO_SPEED_US_PER_SEC = 400.0
 SERVO_UPDATE_PERIOD_S = 0.02
 
-GPIO_PARAMS = {
-    "gpio_enable": 8,
-    "gpio_j1_step": 17,
-    "gpio_j1_dir": 27,
-    "gpio_j2_step": 22,
-    "gpio_j2_dir": 23,
-    "gpio_j3_step": 24,
-    "gpio_j3_dir": 25,
-    "gpio_j4_step": 5,
-    "gpio_j4_dir": 6,
-    "gpio_servo_a": 12,
-    "gpio_servo_b": 13,
-    "gpio_servo_ee": 18,
-}
 
-# Clamp motion_velocity to avoid div-by-zero or absurd rates
-_MOTION_VELOCITY_MIN = 0.01
-_MOTION_VELOCITY_MAX = 10.0
-def _angle_deg_to_pulse_us(angle_deg: float) -> float:
-    """Map servo angle in degrees (0–180) to pulse width us (500–2500), like Arduino Servo library."""
-    return 500.0 + angle_deg * (2000.0 / 180.0)
-
-
-def _pwm_pair_to_diff_joints_deg(pwm_a: float, pwm_b: float):
-    """Inverse of _move_differential: PWM A/B → differential joint angles (deg)."""
-    angle_a = (pwm_a - PWM_CENTER) / US_PER_DEG
-    angle_b = (pwm_b - PWM_CENTER) / US_PER_DEG
-    k = SERVO_GEAR_REDUCTION
-    if abs(k) < 1e-9:
-        return 0.0, 0.0
-    angle4_deg = (angle_a - angle_b) / (2.0 * k)
-    angle5_deg = (angle_a + angle_b) / (2.0 * k)
-    return angle4_deg, angle5_deg
+_JOINT_MAX_VEL_RAD_S_CEIL = 50.0
+_SERVO_PWM_US_PER_SEC_FLOOR = 50.0  # minimum PWM slew when wrist ω limits are tiny
 
 
 class DriverNode(Node):
     def __init__(self):
         super().__init__("driver_node_py")
 
-        for name, default in GPIO_PARAMS.items():
-            self.declare_parameter(name, default)
-        for name, default in {
-            "joint_state_topic": "joint_states",
-            "max_stepper_delta_per_msg": 360.0,
-            "max_steps_per_sec": 2000.0,
-            # Scales stepper steps/s and differential servo slew (1.0 = nominal)
-            "motion_velocity": 1.0,
-            "gear_ratio_j1": GEAR_RATIO_J1,
-            "gear_ratio_j2": GEAR_RATIO_J2,
-            "gear_ratio_j3": GEAR_RATIO_J3,
-            "gear_ratio_j4": GEAR_RATIO_J4,
-            "joint_feedback_topic": "actual_joint_position",
-        }.items():
-            self.declare_parameter(name, default)
+        self.gpio_enable = GPIO_ENABLE
+        self.step_pins = [GPIO_J1_STEP, GPIO_J2_STEP, GPIO_J3_STEP, GPIO_J4_STEP]
+        self.dir_pins = [GPIO_J1_DIR, GPIO_J2_DIR, GPIO_J3_DIR, GPIO_J4_DIR]
+        self.gpio_servo_a = GPIO_SERVO_A
+        self.gpio_servo_b = GPIO_SERVO_B
+        self.gpio_servo_ee = GPIO_SERVO_EE
+        self.joint_state_topic = JOINT_STATE_TOPIC
+        self.max_stepper_delta = max(0.01, min(3600.0, float(MAX_STEPPER_DELTA_PER_MSG)))
+        self.gear_ratios = [GEAR_RATIO_J1, GEAR_RATIO_J2, GEAR_RATIO_J3, GEAR_RATIO_J4]
+        self._joint_feedback_topic = JOINT_FEEDBACK_TOPIC
 
-        p = lambda name: self.get_parameter(name).value
-        self.gpio_enable = p("gpio_enable")
-        self.step_pins = [p("gpio_j1_step"), p("gpio_j2_step"), p("gpio_j3_step"), p("gpio_j4_step")]
-        self.dir_pins = [p("gpio_j1_dir"), p("gpio_j2_dir"), p("gpio_j3_dir"), p("gpio_j4_dir")]
-        self.gpio_servo_a, self.gpio_servo_b, self.gpio_servo_ee = p("gpio_servo_a"), p("gpio_servo_b"), p("gpio_servo_ee")
-        self.joint_state_topic = p("joint_state_topic")
-        self.max_stepper_delta = p("max_stepper_delta_per_msg")
-        self.max_steps_per_sec = p("max_steps_per_sec")
-        self._motion_velocity = self._clamp_motion_velocity(p("motion_velocity"))
-        self.gear_ratios = [p("gear_ratio_j1"), p("gear_ratio_j2"), p("gear_ratio_j3"), p("gear_ratio_j4")]
-        self._joint_feedback_topic = p("joint_feedback_topic")
+        self._motor_full_step_deg = float(MOTOR_FULL_STEP_DEG)
+        self._stepper_microstepping = STEPPER_MICROSTEPPING
+        self._steps_per_motor_rev = (
+            360.0 / self._motor_full_step_deg
+        ) * float(self._stepper_microstepping)
 
-        self.add_on_set_parameters_callback(self._on_parameters_changed)
+        _jseq = list(JOINT_MAX_VELOCITY_RAD_S)
+        _jout = [float(x) for x in _jseq[:7]]
+        while len(_jout) < 7:
+            _jout.append(1.0)
+        self._joint_max_vel_rad_s = [
+            max(0.0, min(_JOINT_MAX_VEL_RAD_S_CEIL, abs(x))) for x in _jout
+        ]
+
         self._feedback_lock = threading.Lock()
-        # Open-loop estimate: 4 stepper joints (rad) + 2 diff servos (rad) + gripper (0=open, 1=closed style)
         self._joint_feedback_rad = [0.0] * 7
         self._pending_steps = [0, 0, 0, 0]
         self._last_step_time = [0.0, 0.0, 0.0, 0.0]
@@ -161,7 +143,7 @@ class DriverNode(Node):
         self._last_servo_update = 0.0
         self._ee_closed = False
         self._last_j_deg = [0.0, 0.0, 0.0, 0.0]
-        self._current_pwm_ee = float(_angle_deg_to_pulse_us(EE_OPEN_DEG))
+        self._current_pwm_ee = float(500.0 + EE_OPEN_DEG * (2000.0 / 180.0))
 
         self._pi = pigpio.pi()
         self._stepper_thread = None
@@ -171,7 +153,6 @@ class DriverNode(Node):
         if not self._pi.connected:
             raise RuntimeError("Could not connect to pigpio daemon. Start it with: sudo pigpiod")
         self.get_logger().info("Using pigpio hardware PWM for servos (GPIO 12, 13, 18).")
-
 
         self._setup_gpio()
         self._sync_servo_joints_feedback_from_pwm()
@@ -199,25 +180,19 @@ class DriverNode(Node):
             10,
         )
 
-    @staticmethod
-    def _clamp_motion_velocity(v: float) -> float:
-        try:
-            x = float(v)
-        except (TypeError, ValueError):
-            x = 1.0
-        return max(_MOTION_VELOCITY_MIN, min(_MOTION_VELOCITY_MAX, x))
-
-    def _on_parameters_changed(self, params):
-        from rcl_interfaces.msg import SetParametersResult
-
-        for param in params:
-            if param.name == "motion_velocity":
-                self._motion_velocity = self._clamp_motion_velocity(param.value)
-        return SetParametersResult(successful=True)
+    def _servo_pwm_step_us_per_tick(self) -> float:
+        """Max change in PWM (µs) per servo tick from joint 5/6 velocity limits (rad/s)."""
+        w4 = self._joint_max_vel_rad_s[4]
+        w5 = self._joint_max_vel_rad_s[5]
+        # Coupled diff: pwm change rate ~ US_PER_DEG * k * (|dq4/dt|+|dq5/dt|) in deg/s
+        pwm_us_per_sec = (
+            US_PER_DEG * SERVO_GEAR_REDUCTION * RAD_TO_DEG * (abs(w4) + abs(w5))
+        )
+        pwm_us_per_sec = max(pwm_us_per_sec, _SERVO_PWM_US_PER_SEC_FLOOR)
+        return pwm_us_per_sec * SERVO_UPDATE_PERIOD_S
 
     def _zero_steppers_callback(self, request, response):
-        """ROS service: zero open-loop joint feedback (does not move hardware or clear step queue)."""
-        del request  # empty
+        del request
         with self._feedback_lock:
             self._joint_feedback_rad = [0.0] * 7
         response.success = True
@@ -226,77 +201,89 @@ class DriverNode(Node):
         return response
 
     def _setup_gpio(self):
-        for p in [self.gpio_enable] + self.step_pins + self.dir_pins:
-            self._pi.set_mode(p, pigpio.OUTPUT)
-            self._pi.write(p, 0)
+        for pin in [self.gpio_enable] + self.step_pins + self.dir_pins:
+            self._pi.set_mode(pin, pigpio.OUTPUT)
+            self._pi.write(pin, 0)
         self._pi.write(self.gpio_enable, 0)
         self._pi.set_servo_pulsewidth(self.gpio_servo_a, PWM_CENTER)
         self._pi.set_servo_pulsewidth(self.gpio_servo_b, PWM_CENTER)
-        self._pi.set_servo_pulsewidth(self.gpio_servo_ee, int(_angle_deg_to_pulse_us(EE_OPEN_DEG)))
+        self._pi.set_servo_pulsewidth(
+            self.gpio_servo_ee, int(500.0 + EE_OPEN_DEG * (2000.0 / 180.0))
+        )
 
     def _steps_for_delta_deg(self, axis: int, delta_deg: float) -> int:
-        return int(round(delta_deg * STEPS_PER_REV * self.gear_ratios[axis] / 360.0))
-
-    def _step_delta_rad(self, axis: int, direction: int) -> float:
-        """Joint angle change (rad) for one full step in +direction on this axis."""
-        gr = max(self.gear_ratios[axis], 1e-9)
-        joint_deg_per_step = 360.0 / (STEPS_PER_REV * gr)
-        return direction * joint_deg_per_step * DEG_TO_RAD
+        return int(
+            round(delta_deg * self._steps_per_motor_rev * self.gear_ratios[axis] / 360.0)
+        )
 
     def _sync_servo_joints_feedback_from_pwm(self) -> None:
-        """Update feedback indices 4–5 from current differential PWM (under _feedback_lock)."""
-        d4_deg, d5_deg = _pwm_pair_to_diff_joints_deg(self._current_pwm_a, self._current_pwm_b)
+        pa, pb = self._current_pwm_a, self._current_pwm_b
+        angle_a = (pa - PWM_CENTER) / US_PER_DEG
+        angle_b = (pb - PWM_CENTER) / US_PER_DEG
+        k = SERVO_GEAR_REDUCTION
+        if abs(k) < 1e-9:
+            d4_deg, d5_deg = 0.0, 0.0
+        else:
+            d4_deg = (angle_a - angle_b) / (2.0 * k)
+            d5_deg = (angle_a + angle_b) / (2.0 * k)
         with self._feedback_lock:
             self._joint_feedback_rad[4] = d4_deg * DEG_TO_RAD
             self._joint_feedback_rad[5] = DIFF_JOINT6_SIGN * d5_deg * DEG_TO_RAD
 
-    def _do_one_step(self, axis: int, direction: int):
-        self._pi.write(self.dir_pins[axis], 1 if direction > 0 else 0)
-        self._pi.write(self.step_pins[axis], 1)
-        time.sleep(STEP_PULSE_S)
-        self._pi.write(self.step_pins[axis], 0)
-
     def _stepper_loop(self):
+        """Background thread: rate-limited stepping, GPIO pulse, joint-angle feedback update."""
         while not self._shutdown:
-            # Effective step rate = nominal * motion_velocity
-            v = self._motion_velocity
-            rate = max(1e-6, float(self.max_steps_per_sec) * v)
-            min_interval = 1.0 / rate
             now = time.monotonic()
             with self._step_lock:
                 for axis in range(4):
                     if self._pending_steps[axis] == 0:
                         continue
+                    omega = max(self._joint_max_vel_rad_s[axis], 1e-9)
+                    rate = omega * (
+                        self._steps_per_motor_rev
+                        * self.gear_ratios[axis]
+                        / (2.0 * math.pi)
+                    )
+                    rate = max(1e-6, rate)
+                    min_interval = 1.0 / rate
                     if now - self._last_step_time[axis] < min_interval:
                         continue
                     direction = 1 if self._pending_steps[axis] > 0 else -1
-                    self._do_one_step(axis, direction)
+                    self._pi.write(self.dir_pins[axis], 1 if direction > 0 else 0)
+                    self._pi.write(self.step_pins[axis], 1)
+                    time.sleep(STEP_PULSE_S)
+                    self._pi.write(self.step_pins[axis], 0)
                     self._pending_steps[axis] -= direction
                     self._last_step_time[axis] = now
-                    dtheta = self._step_delta_rad(axis, direction) * STEPPER_JOINT_DIR_SIGN[axis]
+                    gr = max(self.gear_ratios[axis], 1e-9)
+                    joint_deg_per_step = 360.0 / (self._steps_per_motor_rev * gr)
+                    dtheta = (
+                        direction
+                        * joint_deg_per_step
+                        * DEG_TO_RAD
+                        * STEPPER_JOINT_DIR_SIGN[axis]
+                    )
                     with self._feedback_lock:
                         self._joint_feedback_rad[axis] += dtheta
-            time.sleep(0.0001)
+            time.sleep(0.00001)
 
     def _start_stepper_thread(self):
         self._stepper_thread = threading.Thread(target=self._stepper_loop, daemon=True)
         self._stepper_thread.start()
 
     def _step_toward(self, current: float, target: float, step: float) -> float:
-        """Move current toward target by at most step (servo PWM ramp)."""
         if abs(target - current) <= step:
             return target
         return current + (step if target > current else -step)
 
     def _servo_tick(self):
-        """Every UPDATE_PERIOD_S, ramp current PWM toward target and write integer µs when changed."""
         if not self._pi.connected:
             return
         now = time.monotonic()
         if now - self._last_servo_update < SERVO_UPDATE_PERIOD_S:
             return
         self._last_servo_update = now
-        step_us = SERVO_SPEED_US_PER_SEC * SERVO_UPDATE_PERIOD_S * self._motion_velocity
+        step_us = self._servo_pwm_step_us_per_tick()
         self._current_pwm_a = self._step_toward(self._current_pwm_a, self._target_pwm_a, step_us)
         self._current_pwm_b = self._step_toward(self._current_pwm_b, self._target_pwm_b, step_us)
         cur_a = int(round(self._current_pwm_a))
@@ -313,7 +300,6 @@ class DriverNode(Node):
         self._servo_timer = self.create_timer(SERVO_UPDATE_PERIOD_S, self._servo_tick)
 
     def _move_differential(self, angle4_deg: float, angle5_deg: float):
-        """Set target PWM for differential servos; smoothing happens in _servo_tick."""
         angle_a = SERVO_GEAR_REDUCTION * (angle4_deg + angle5_deg)
         angle_b = SERVO_GEAR_REDUCTION * (-angle4_deg + angle5_deg)
         angle_a = max(-SERVO_RANGE_DEG, min(SERVO_RANGE_DEG, angle_a))
@@ -322,7 +308,6 @@ class DriverNode(Node):
         self._target_pwm_b = int(max(PWM_MIN, min(PWM_MAX, PWM_CENTER + angle_b * US_PER_DEG)))
 
     def _publish_joint_feedback(self) -> None:
-        """50 Hz: snapshot open-loop joint estimate and publish (executor thread)."""
         with self._feedback_lock:
             positions = [float(x) for x in self._joint_feedback_rad]
         msg = JointState()
@@ -333,9 +318,7 @@ class DriverNode(Node):
     def _on_joint_state(self, msg):
         position = list(msg.position)
         if len(position) < 7:
-            self.get_logger().warn_throttle(
-                1.0, "JointState position must have 7 elements (j1..j4 + diff servos + gripper)"
-            )
+            print("JointState position must have 7 elements (j1..j4 + diff servos + gripper)", position)
             return
 
         j1_rad, j2_rad, j3_rad, j4_rad, diff_a_rad, diff_b_rad, gripper_rad = position[:7]
@@ -347,11 +330,11 @@ class DriverNode(Node):
         d1, d2, d3, d4 = [cur - last for cur, last in zip(j_deg, prev_j_deg)]
         self._last_j_deg = j_deg
 
-        cap = self.max_stepper_delta
-        d1 = max(-cap, min(cap, d1))
-        d2 = max(-cap, min(cap, d2))
-        d3 = max(-cap, min(cap, d3))
-        d4 = max(-cap, min(cap, d4))
+        # cap = self.max_stepper_delta
+        # d1 = max(-cap, min(cap, d1))
+        # d2 = max(-cap, min(cap, d2))
+        # d3 = max(-cap, min(cap, d3))
+        # d4 = max(-cap, min(cap, d4))
 
         deltas = (d1, d2, d3, d4)
         with self._step_lock:
@@ -360,15 +343,15 @@ class DriverNode(Node):
                     axis, deltas[axis]
                 )
 
-        # Differential servos: joint 5 = diff_a, joint 6 = diff_b (sign-flipped for hardware convention)
         self._move_differential(diff_a_deg, DIFF_JOINT6_SIGN * diff_b_deg)
 
-        # End effector
         closed = gripper_rad > 0.5
         if closed != self._ee_closed:
             self._ee_closed = closed
             angle = EE_CLOSE_DEG if closed else EE_OPEN_DEG
-            pulse_us = int(max(PWM_MIN, min(PWM_MAX, _angle_deg_to_pulse_us(angle))))
+            pulse_us = int(
+                max(PWM_MIN, min(PWM_MAX, 500.0 + angle * (2000.0 / 180.0)))
+            )
             self._current_pwm_ee = float(pulse_us)
             self._pi.set_servo_pulsewidth(self.gpio_servo_ee, pulse_us)
             with self._feedback_lock:
