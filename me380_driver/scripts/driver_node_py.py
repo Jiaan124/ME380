@@ -19,8 +19,9 @@ Servos: GPIO 12/13/18 use hardware PWM via pigpio for stable timing and less jit
 Ensure the daemon is running: sudo pigpiod
 
 Joint mapping (JointState.position array only; names are ignored):
-  position[0..3] -> steppers J1..J4 (rad; driver uses delta from last)
-  position[4], position[5] -> differential servo angles (rad)
+  position[0..3] -> steppers J1..J4 (rad; driver uses delta from last).
+  J2 (Y) and J4 (A) step direction is inverted in software vs J1/J3 to match wiring.
+  position[4], position[5] -> differential pair (joint 5 & 6, rad); joint 6 only is sign-flipped in software.
   position[6] -> gripper (0 = open, >0.5 = closed)
   This robot always publishes 7 values in JointState.position.
 
@@ -69,6 +70,10 @@ EE_CLOSE_DEG = 100.0
 
 STEP_PULSE_US = 5
 STEP_PULSE_S = STEP_PULSE_US / 1e6
+# Per-axis sign for step queue + feedback: +1 default, -1 = joint angle vs motor reversed (J2=Y, J4=A).
+STEPPER_JOINT_DIR_SIGN = (1, -1, 1, -1)
+# Joint 6 = JointState position[5] (second diff DOF). Joint 5 = position[4]. Flip only joint 6 vs servos.
+DIFF_JOINT6_SIGN = -1
 # ESP32/Arduino-style servo timing: 20 ms update, ramp toward target at 400 us/s (stable integer PWM writes).
 SERVO_SPEED_US_PER_SEC = 400.0
 SERVO_UPDATE_PERIOD_S = 0.02
@@ -243,7 +248,7 @@ class DriverNode(Node):
         d4_deg, d5_deg = _pwm_pair_to_diff_joints_deg(self._current_pwm_a, self._current_pwm_b)
         with self._feedback_lock:
             self._joint_feedback_rad[4] = d4_deg * DEG_TO_RAD
-            self._joint_feedback_rad[5] = d5_deg * DEG_TO_RAD
+            self._joint_feedback_rad[5] = DIFF_JOINT6_SIGN * d5_deg * DEG_TO_RAD
 
     def _do_one_step(self, axis: int, direction: int):
         self._pi.write(self.dir_pins[axis], 1 if direction > 0 else 0)
@@ -268,7 +273,7 @@ class DriverNode(Node):
                     self._do_one_step(axis, direction)
                     self._pending_steps[axis] -= direction
                     self._last_step_time[axis] = now
-                    dtheta = self._step_delta_rad(axis, direction)
+                    dtheta = self._step_delta_rad(axis, direction) * STEPPER_JOINT_DIR_SIGN[axis]
                     with self._feedback_lock:
                         self._joint_feedback_rad[axis] += dtheta
             time.sleep(0.0001)
@@ -348,14 +353,15 @@ class DriverNode(Node):
         d3 = max(-cap, min(cap, d3))
         d4 = max(-cap, min(cap, d4))
 
+        deltas = (d1, d2, d3, d4)
         with self._step_lock:
-            self._pending_steps[0] += self._steps_for_delta_deg(0, d1)
-            self._pending_steps[1] += self._steps_for_delta_deg(1, d2)
-            self._pending_steps[2] += self._steps_for_delta_deg(2, d3)
-            self._pending_steps[3] += self._steps_for_delta_deg(3, d4)
+            for axis in range(4):
+                self._pending_steps[axis] += STEPPER_JOINT_DIR_SIGN[axis] * self._steps_for_delta_deg(
+                    axis, deltas[axis]
+                )
 
-        # Differential servos: set targets; _servo_tick ramps PWM toward them
-        self._move_differential(diff_a_deg, diff_b_deg)
+        # Differential servos: joint 5 = diff_a, joint 6 = diff_b (sign-flipped for hardware convention)
+        self._move_differential(diff_a_deg, DIFF_JOINT6_SIGN * diff_b_deg)
 
         # End effector
         closed = gripper_rad > 0.5
