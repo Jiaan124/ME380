@@ -10,15 +10,9 @@
  *   - Messages are line-oriented: one command per line, terminated by '\n'.
  *   - Numbers may be separated by spaces, commas, or tabs (see parseFloatLine).
  *
- * TRAJECTORY PROTOCOL (flow-controlled streaming)
+ * SERIAL COMMAND PROTOCOL (streaming)
  *
- *   1) Host sends:  LOAD <N>
- *      N = total number of trajectory rows to execute (positive integer).
- *
- *   2) Board replies: READY
- *                    NEXT          (permission to send the first row)
- *
- *   3) Host sends rows one at a time. Each row is exactly 13 floating-point
+ *   Host sends rows one at a time. Each row is exactly 13 floating-point
  *      values in this order:
  *
  *        [0..5]   Joint 1..6 "position" fields (degrees), interpreted as:
@@ -35,26 +29,19 @@
  *
  *        [12]     Gripper: passed to Servo.write (clamped 0..180).
  *
- *   4) After each row is accepted into the ring buffer, if execution has not
- *      started yet, board sends: EXEC (first valid row received).
+ *   Board stores incoming rows in a ring buffer (TRAJ_BUFFER_POINTS) and
+ *   executes one buffered row at a time (strictly sequential commands).
  *
- *   5) Board pops one buffered row every COMMAND_PERIOD_MS (20 ms) and applies
- *      it. When it needs another row and buffer has space, it sends: NEXT
- *      Host should send the next line only after NEXT (or after READY's NEXT)
- *      to avoid ERR: wait NEXT when the buffer is full (TRAJ_BUFFER_POINTS).
+ *   If a new row arrives while motion is still running, it is queued (unless
+ *   the buffer is full). This allows pipelined command streaming.
  *
- *   6) When all N rows have been dispatched, no further NEXT is sent for new
- *      data. After steppers finish and wrist servos reach their PWM targets,
- *      board sends: FINISHED
+ *   After the queue drains and all mechanics reach target, board sends:
+ *      FINISHED
  *
- *   NEXT means "you may send another row" — not "motion is complete."
- *   FINISHED means the whole trajectory is done and mechanics have settled.
+ *   FINISHED marks that all queued commands are done and motion has settled.
  *
  * ERROR LINES (examples)
- *   ERR: expected LOAD <N>     — line received outside a load/execute session.
- *   ERR: invalid N             — LOAD N with N <= 0.
- *   ERR: too many rows         — more than N rows accepted.
- *   ERR: wait NEXT             — buffer full; wait for NEXT before sending.
+ *   ERR: buffer full           — queue full; retry later.
  *   ERR: row must have 13 numbers — bad row format.
  *
  * SIGN CONVENTIONS (software vs hardware)
@@ -136,7 +123,6 @@ const double US_PER_DEG = 2000.0 / 270.0;
 
 const double SERVO_SPEED_US_PER_SEC = 400.0;
 const int UPDATE_PERIOD_MS = 20;
-const int COMMAND_PERIOD_MS = 20;
 const int TRAJ_BUFFER_POINTS = 8;
 
 int currentPwmA = PWM_CENTER;
@@ -162,17 +148,11 @@ TrajectoryPoint trajBuffer[TRAJ_BUFFER_POINTS];
 int trajHead = 0;
 int trajTail = 0;
 int trajBufferedCount = 0;
-int trajPointCount = 0;
-int trajRowsReceived = 0;
-int trajRowsDispatched = 0;
-bool isLoadingTrajectory = false;
 bool isExecutingTrajectory = false;
 bool finishedFlagSent = false;
-unsigned long lastCommandDispatch = 0;
 
 bool parseFloatLine(const String& line, float* values, int expectedCount);
 void handleSerialInput();
-void startTrajectoryLoad(int count);
 void loadTrajectoryRow(const String& line);
 void dispatchTrajectoryPoint(const TrajectoryPoint& p);
 void moveSteppers(float dJ1, float dJ2, float dJ3, float dJ4,
@@ -226,29 +206,21 @@ void loop() {
   updateServos();
   handleSerialInput();
 
-  if (isExecutingTrajectory && trajBufferedCount > 0 &&
-      millis() - lastCommandDispatch >= COMMAND_PERIOD_MS) {
+  // Execute one queued command at a time.
+  if (!isExecutingTrajectory && trajBufferedCount > 0) {
     const TrajectoryPoint p = trajBuffer[trajHead];
     trajHead = (trajHead + 1) % TRAJ_BUFFER_POINTS;
     trajBufferedCount--;
     dispatchTrajectoryPoint(p);
-    trajRowsDispatched++;
-    lastCommandDispatch = millis();
-
-    if (trajRowsReceived < trajPointCount && trajBufferedCount < TRAJ_BUFFER_POINTS) {
-      Serial.println("NEXT");
-    }
+    isExecutingTrajectory = true;
+    finishedFlagSent = false;
   }
 
-  if (isExecutingTrajectory &&
-      trajRowsDispatched >= trajPointCount &&
-      trajBufferedCount == 0 &&
-      isMotionDone() &&
-      !finishedFlagSent) {
-    isExecutingTrajectory = false;
-    isLoadingTrajectory = false;
+  // Emit one FINISHED for this specific command when motion settles.
+  if (isExecutingTrajectory && isMotionDone() && !finishedFlagSent) {
     finishedFlagSent = true;
     Serial.println("FINISHED");
+    isExecutingTrajectory = false;
   }
 }
 
@@ -373,48 +345,12 @@ void handleSerialInput() {
   if (line.length() == 0) {
     return;
   }
-
-  if (line.startsWith("LOAD ")) {
-    int count = line.substring(5).toInt();
-    startTrajectoryLoad(count);
-    return;
-  }
-
-  if (isLoadingTrajectory || isExecutingTrajectory) {
-    loadTrajectoryRow(line);
-    return;
-  }
-
-  Serial.println("ERR: expected LOAD <N>");
-}
-
-void startTrajectoryLoad(int count) {
-  if (count <= 0) {
-    Serial.println("ERR: invalid N");
-    return;
-  }
-
-  trajPointCount = count;
-  trajRowsReceived = 0;
-  trajRowsDispatched = 0;
-  trajHead = 0;
-  trajTail = 0;
-  trajBufferedCount = 0;
-  isLoadingTrajectory = true;
-  isExecutingTrajectory = false;
-  finishedFlagSent = false;
-  Serial.println("READY");
-  Serial.println("NEXT");
+  loadTrajectoryRow(line);
 }
 
 void loadTrajectoryRow(const String& line) {
-  if (trajRowsReceived >= trajPointCount) {
-    Serial.println("ERR: too many rows");
-    return;
-  }
-
   if (trajBufferedCount >= TRAJ_BUFFER_POINTS) {
-    Serial.println("ERR: wait NEXT");
+    Serial.println("ERR: buffer full");
     return;
   }
 
@@ -434,16 +370,9 @@ void loadTrajectoryRow(const String& line) {
   trajBuffer[trajTail] = p;
   trajTail = (trajTail + 1) % TRAJ_BUFFER_POINTS;
   trajBufferedCount++;
-  trajRowsReceived++;
 
   if (!isExecutingTrajectory) {
-    isExecutingTrajectory = true;
-    lastCommandDispatch = millis() - COMMAND_PERIOD_MS;
-    Serial.println("EXEC");
-  }
-
-  if (trajRowsReceived >= trajPointCount) {
-    isLoadingTrajectory = false;
+    finishedFlagSent = false;
   }
 }
 
