@@ -5,6 +5,7 @@ find_package(ament_cmake REQUIRED)
 
 install(PROGRAMS
   scripts/driver_node_py.py
+  scripts/esp_32_bridge.py
   scripts/ik.py
   DESTINATION lib/${PROJECT_NAME})
 
