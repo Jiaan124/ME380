@@ -1,8 +1,73 @@
 /*
-BOARD: Arduino Uno
-Shield: CNC Shield V3
-LIBS: AccelStepper.h, Servo.h
-*/
+ * ME380 robot firmware — serial trajectory interface
+ *
+ * HARDWARE
+ *   Board: Arduino Uno (see comments in code for CNC Shield V3 pin map.)
+ *   Libraries: AccelStepper, Servo
+ *
+ * SERIAL
+ *   - Configure baud in setup() with Serial.begin(...); host must match.
+ *   - Messages are line-oriented: one command per line, terminated by '\n'.
+ *   - Numbers may be separated by spaces, commas, or tabs (see parseFloatLine).
+ *
+ * TRAJECTORY PROTOCOL (flow-controlled streaming)
+ *
+ *   1) Host sends:  LOAD <N>
+ *      N = total number of trajectory rows to execute (positive integer).
+ *
+ *   2) Board replies: READY
+ *                    NEXT          (permission to send the first row)
+ *
+ *   3) Host sends rows one at a time. Each row is exactly 13 floating-point
+ *      values in this order:
+ *
+ *        [0..5]   Joint 1..6 "position" fields (degrees), interpreted as:
+ *                 - Joints 1..4: delta angle for this timestep (typically
+ *                   one 20 ms sample at 50 Hz). Step commands accumulate
+ *                   (AccelStepper::move) so bursts do not cancel in-flight motion.
+ *                 - Joints 5..6: absolute joint angles (deg) for the differential
+ *                   wrist; not accumulated across rows.
+ *
+ *        [6..11]  Joint 1..6 velocity (deg/s). Used as motion rate hints:
+ *                 - Stepper speeds use abs(velocity); step direction follows
+ *                   the sign of the delta, not the velocity sign.
+ *                 - Differential servos use max(abs(vel5), abs(vel6)) for slew.
+ *
+ *        [12]     Gripper: passed to Servo.write (clamped 0..180).
+ *
+ *   4) After each row is accepted into the ring buffer, if execution has not
+ *      started yet, board sends: EXEC (first valid row received).
+ *
+ *   5) Board pops one buffered row every COMMAND_PERIOD_MS (20 ms) and applies
+ *      it. When it needs another row and buffer has space, it sends: NEXT
+ *      Host should send the next line only after NEXT (or after READY's NEXT)
+ *      to avoid ERR: wait NEXT when the buffer is full (TRAJ_BUFFER_POINTS).
+ *
+ *   6) When all N rows have been dispatched, no further NEXT is sent for new
+ *      data. After steppers finish and wrist servos reach their PWM targets,
+ *      board sends: FINISHED
+ *
+ *   NEXT means "you may send another row" — not "motion is complete."
+ *   FINISHED means the whole trajectory is done and mechanics have settled.
+ *
+ * ERROR LINES (examples)
+ *   ERR: expected LOAD <N>     — line received outside a load/execute session.
+ *   ERR: invalid N             — LOAD N with N <= 0.
+ *   ERR: too many rows         — more than N rows accepted.
+ *   ERR: wait NEXT             — buffer full; wait for NEXT before sending.
+ *   ERR: row must have 13 numbers — bad row format.
+ *
+ * SIGN CONVENTIONS (software vs hardware)
+ *   - Joint 2 and joint 4 stepper deltas are negated in moveSteppers() so
+ *     positive commanded deltas match the intended physical direction.
+ *   - Joint 6 (sixth axis in the row) is negated before the differential map
+ *     so the composed sixth axis matches convention; both wrist servos are
+ *     driven from the same moveDifferential() mix.
+ *
+ * STARTUP
+ *   On reset, board may print a ready banner (e.g. "CNC Shield Robot Ready").
+ */
+
 
 #include <AccelStepper.h>
 #include <Servo.h>
