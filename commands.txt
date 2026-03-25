@@ -27,3 +27,7 @@ ros2 launch me380_driver driver_python.launch.py
 # Zero open-loop joint feedback (check: ros2 service list)
 ros2 service call /zero_steppers std_srvs/srv/Trigger
 ros2 run xacro xacro me380_driver/urdf/me380_robot.urdf.xacro -o me380_driver/urdf/me380_robot.urdf
+
+#send serial to arduino
+screen /dev/ttyACM0 115200
+
