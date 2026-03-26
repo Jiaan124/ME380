@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import os
-
+import time
 import ikpy.chain
 import numpy as np
 import ikpy.utils.plot as plot_utils
@@ -31,83 +31,6 @@ current FK position + delta (same frame as the URDF chain).
 # acceleration in one dimension (distance along the segment), then x = p0 + u * s.
 
 
-def _s_trapezoid(t: float, L: float, v_max: float, a: float) -> float:
-    """Distance along segment [0, L] at time t under accel-limited motion (SI: m, m/s, m/s^2, s)."""
-    if L <= 1e-12:
-        return 0.0
-    a = max(float(a), 1e-6)
-    v_max = max(float(v_max), 1e-9)
-    s_acc_full = v_max * v_max / (2.0 * a)
-    if 2.0 * s_acc_full >= L:
-        # Triangular: peak speed sqrt(a * L)
-        v_peak = math.sqrt(a * L)
-        t_acc = v_peak / a
-        T = 2.0 * t_acc
-        if t <= 0.0:
-            return 0.0
-        if t >= T:
-            return L
-        if t <= t_acc:
-            return 0.5 * a * t * t
-        tau = t - t_acc
-        s_mid = 0.5 * a * t_acc * t_acc
-        return s_mid + v_peak * tau - 0.5 * a * tau * tau
-    # Trapezoidal
-    t_acc = v_max / a
-    s_acc = v_max * v_max / (2.0 * a)
-    s_const = L - 2.0 * s_acc
-    t_const = s_const / v_max
-    T = 2.0 * t_acc + t_const
-    if t <= 0.0:
-        return 0.0
-    if t >= T:
-        return L
-    if t <= t_acc:
-        return 0.5 * a * t * t
-    if t <= t_acc + t_const:
-        return s_acc + v_max * (t - t_acc)
-    tau = t - t_acc - t_const
-    return s_acc + s_const + v_max * tau - 0.5 * a * tau * tau
-
-
-def cartesian_line_samples(
-    p0: np.ndarray,
-    p1: np.ndarray,
-    v_max: float,
-    a: float,
-    dt: float,
-) -> np.ndarray:
-    """
-    Sample positions along a straight line from p0 to p1 (each shape (3,)), meters.
-    Returns array of shape (N, 3). Includes endpoints; spacing in time is dt.
-    """
-    p0 = np.asarray(p0, dtype=float).reshape(3)
-    p1 = np.asarray(p1, dtype=float).reshape(3)
-    d = p1 - p0
-    L = float(np.linalg.norm(d))
-    if L < 1e-12:
-        return p0.reshape(1, 3)
-    u = d / L
-    a = max(float(a), 1e-6)
-    v_max = max(float(v_max), 1e-9)
-    s_acc_full = v_max * v_max / (2.0 * a)
-    if 2.0 * s_acc_full >= L:
-        v_peak = math.sqrt(a * L)
-        T = 2.0 * v_peak / a
-    else:
-        t_acc = v_max / a
-        s_acc = v_max * v_max / (2.0 * a)
-        s_const = L - 2.0 * s_acc
-        t_const = s_const / v_max
-        T = 2.0 * t_acc + t_const
-    dt = max(float(dt), 1e-6)
-    times = np.arange(0.0, T + 0.5 * dt, dt)
-    if times[-1] < T - 1e-9:
-        times = np.append(times, T)
-    s_vals = np.array([_s_trapezoid(float(t), L, v_max, a) for t in times])
-    return p0 + s_vals[:, np.newaxis] * u
-
-
 def _default_urdf_path() -> str:
     """Installed URDF: share/me380_driver/urdf/me380_robot.urdf (after colcon build + source)."""
     pkg_share = get_package_share_directory("me380_driver")
@@ -121,7 +44,7 @@ class ikNode(Node):
         self.declare_parameter("filepath", _default_urdf_path())
         self.filepath = self.get_parameter("filepath").value
         self.publisher_ = self.create_publisher(JointState, "joint_states", 10) #message type, topic name, buffer size
-        self.declare_parameter("cartesian_linear_velocity_m_s", 0.05)
+        self.declare_parameter("cartesian_linear_velocity_m_s", 0.02)
         self.declare_parameter("cartesian_sample_period_s", 0.02)
         self.declare_parameter("cartesian_linear_accel_m_s2", 0.2)
         self.sub = self.create_subscription(  #take in x, y, z and euler angles? or should it take in x y z and rotation matrix?
@@ -152,14 +75,7 @@ class ikNode(Node):
         self.my_chain = ikpy.chain.Chain.from_urdf_file(self.filepath, active_links_mask=[False, True, True, True, True, True, True, False])
         #needed to have correct arm orientation when solving 2.64 rad = 151 deg, 1.57 rad = 90
         self.current_position = [0, 0, 0, 0, 0, 0, 0, 0]
-        self.ik = [0, 0, 0.5, 0, 0.0, 0.0, 0, 0]
-        self._traj_timer = None
-        self._traj_rows = []
-        self._traj_idx = 0
-        self._traj_period_s = 0.02
-        # When True, Cartesian timer publishes joint velocities for esp_32_bridge vel_mode.
-        self._publish_joint_velocities = False
-        self._bridge_set_params_client = None
+        self.ik_init = [0, 0, 0.8212, -1.6, 0, -0.793, 0, 0]
         print("ik node running")
 
     def _stamp_joint_state(self, js: JointState) -> None:
@@ -181,14 +97,14 @@ class ikNode(Node):
 
         if self.joint_space: #move in joint space to target orientation
             #should only need to give end position because velocity is linear
-            seed = self.current_position if self.current_position is not None else self.ik
-            self.ik = self.my_chain.inverse_kinematics(
-                target_position, target_orientation, orientation_mode="all", initial_position=self.ik
+            seed = self.current_position if self.current_position is not None else self.ik_init
+            self.ik_init = self.my_chain.inverse_kinematics(
+                target_position, target_orientation, orientation_mode="all", initial_position=seed
             )
 
             out = JointState()
             self._stamp_joint_state(out)
-            out.position = self.ik[1:7].tolist()  # get rid of dummy link
+            out.position = self.ik_init[1:7].tolist()  # get rid of dummy link
             # print("Joint Angles: ", list(map(lambda r: math.degrees(r), self.ik[1:7].tolist())))
             out.position.append(0) #TODO: CHANGE THIS> THIS ONLY EXISTS BECAUSE IM LAZY TO DO GRIPPER
             self.publisher_.publish(out)
@@ -213,8 +129,8 @@ class ikNode(Node):
         dt = float(self.get_parameter("cartesian_sample_period_s").value)
         # accel = float(self.get_parameter("cartesian_linear_accel_m_s2").value)
 
-        # target_xyz = np.array(msg.data[:3], dtype=float)
-        target_xyz = np.array([0.35, 0.0, 0.15]) #0, 0.436, -0.804
+        target_xyz = np.array(msg.data[:3], dtype=float)
+        # target_xyz = np.array([0.35, 0.0, 0.15]) #0, 0.436, -0.804
         # seed = self.current_position if self.current_position is not None else self.ik
         seed = [0, 0, 0.8212, -1.6, 0, -0.793, 0, 0]  #0.25, 0, 0.15
         fk0 = self.my_chain.forward_kinematics(seed)
@@ -259,10 +175,25 @@ class ikNode(Node):
             seed = joint_angles
             joint_cols = np.vstack((joint_cols, np.array(joint_angles[1:7], dtype=float)))
         print(joint_cols)
-        print(waypoints.shape, joint_cols.shape)
+        print(waypoints.shape[0], joint_cols.shape[0])
 
         gripper_pos = 0.0
         
+        #publish from array every dt seconds
+        rate = self.create_rate(1.0 / dt)
+        for i in range(joint_cols.shape[0]):
+            next_time = time.time()
+            out = JointState()
+            self._stamp_joint_state(out)
+            out.position = joint_cols[i].tolist()
+            out.position.append(0) #TODO: CHANGE THIS> THIS ONLY EXISTS BECAUSE IM LAZY TO DO GRIPPER
+            self.publisher_.publish(out)
+            print(joint_cols[i])
+            next_time += dt
+            sleep_time = next_time - time.time()        
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
 
 
 def main(args=None):
