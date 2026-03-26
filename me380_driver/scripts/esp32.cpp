@@ -1,6 +1,17 @@
 /*
  * ME380 robot firmware — serial trajectory interface
  *
+ * HARDWARE
+ *   Board: Arduino Uno (see comments in code for CNC Shield V3 pin map.)
+ *   Libraries: AccelStepper, Servo
+ *
+ * SERIAL
+ *   - Configure baud in setup() with Serial.begin(...); host must match.
+ *   - Messages are line-oriented: one command per line, terminated by '\n'.
+ *   - Numbers may be separated by spaces, commas, or tabs (see parseFloatLine).
+ *
+ * SERIAL COMMAND PROTOCOL (streaming)
+ *
  *   Host sends rows one at a time. Each row is exactly 13 floating-point
  *      values in this order:
  *
@@ -18,28 +29,22 @@
  *
  *        [12]     Gripper: passed to Servo.write (clamped 0..180).
  *
- *   Board stores incoming rows in a ring buffer (TRAJ_BUFFER_POINTS) and
- *   executes one buffered row at a time (strictly sequential commands).
+ *   Board applies each received row immediately (no queue).
  *
- *   If a new row arrives while motion is still running, it is queued (unless
- *   the buffer is full). This allows pipelined command streaming.
- *
- *   After the queue drains and all mechanics reach target, board sends:
+ *   After the mechanics reach target, board sends:
  *      FINISHED
  *
- *   FINISHED marks that all queued commands are done and motion has settled.
+ *   FINISHED marks that the last received command has settled.
  *
  * MODE (line-oriented, not counted as trajectory rows)
  *   MODE TRAJ                         — position / delta streaming (13 floats per row).
  *   MODE VEL [vel_time_ms]          — velocity streaming (7 floats per row).
  *                                       Default vel_time_ms = 25 if omitted.
- *   In VEL mode steppers use setSpeed + runSpeed(); segments advance every vel_time_ms
- *   or immediately when a new velocity row arrives (whichever comes first). From idle,
- *   motion starts after VEL_MODE_START_BUFFER rows are queued; if the queue empties,
- *   wait for that many rows again before restarting.
+ *   In VEL mode steppers use setSpeed + runSpeed(); each received row becomes the new
+ *   commanded velocity for the next vel_time_ms window. If no new row arrives before
+ *   the timer expires, motion stops and FINISHED is emitted.
  *
  * ERROR LINES (examples)
- *   ERR: buffer full           — queue full; retry later.
  *   ERR: row must have 13 numbers — bad row format.
  *
  * SIGN CONVENTIONS (software vs hardware)
@@ -121,8 +126,7 @@
  
  const double SERVO_SPEED_US_PER_SEC = 400.0;
  const int UPDATE_PERIOD_MS = 20;
- const int TRAJ_BUFFER_POINTS = 8;
-const int VEL_MODE_START_BUFFER = 5;
+// (No trajectory/velocity queue in this firmware.)
  
  int currentPwmA = PWM_CENTER;
  int currentPwmB = PWM_CENTER;
@@ -143,10 +147,6 @@ const int VEL_MODE_START_BUFFER = 5;
    float gripperPos;      // Gripper angle command
  };
  
- TrajectoryPoint trajBuffer[TRAJ_BUFFER_POINTS];
- int trajHead = 0;
- int trajTail = 0;
- int trajBufferedCount = 0;
  bool isExecutingTrajectory = false;
  bool finishedFlagSent = false;
  
@@ -165,7 +165,6 @@ void loadVelocityRow(const String& line);
  void moveEndEffector(float gripperPos);
  bool isMotionDone();
  int stepToward(int current, int target, double step);
-void enqueueTrajectoryPoint(const TrajectoryPoint& p);
  void processVelocityMode();
 
 bool velocityModeEnabled = false;
@@ -176,7 +175,6 @@ double velocityModeJoint6Deg = 0.0;
 // Velocity streaming: timer + optional early advance when a new line arrives.
 bool velModeRunning = false;           // true while draining or finishing last segment
 bool velSegmentActive = false;         // true while a velocity segment is running
-bool velRxLinePending = false;         // set when a velocity row was enqueued this cycle
 unsigned long velSegmentEndMs = 0;
 unsigned long velSegmentStartMs = 0;
 float velSegVel5DegPerSec = 0.0f;
@@ -193,13 +191,13 @@ float velSegVel6DegPerSec = 0.0f;
    pinMode(STEPPER_ENABLE, OUTPUT);
    digitalWrite(STEPPER_ENABLE, LOW);   // Enable drivers
  
-   stepper1.setMaxSpeed(3000);
+   stepper1.setMaxSpeed(4000);
  
-   stepper2.setMaxSpeed(3000);
+   stepper2.setMaxSpeed(10000);
  
-   stepper3.setMaxSpeed(3000);
+   stepper3.setMaxSpeed(10000);
  
-   stepper4.setMaxSpeed(3000);
+   stepper4.setMaxSpeed(4000);
  
    servoA.attach(SERVO_A_PIN);
    servoB.attach(SERVO_B_PIN);
@@ -236,16 +234,6 @@ float velSegVel6DegPerSec = 0.0f;
    if (velocityModeEnabled) {
      processVelocityMode();
    } else {
-     // Execute one queued command at a time (position / trajectory rows).
-     if (!isExecutingTrajectory && trajBufferedCount > 0) {
-       const TrajectoryPoint p = trajBuffer[trajHead];
-       trajHead = (trajHead + 1) % TRAJ_BUFFER_POINTS;
-       trajBufferedCount--;
-       dispatchTrajectoryPoint(p);
-       isExecutingTrajectory = true;
-       finishedFlagSent = false;
-     }
- 
      // Emit one FINISHED for this specific command when motion settles.
      if (isExecutingTrajectory && isMotionDone() && !finishedFlagSent) {
        finishedFlagSent = true;
@@ -339,57 +327,26 @@ void dispatchVelocityPoint(const TrajectoryPoint& p) {
   velSegmentActive = true;
 }
 
-static void dequeueAndApplyVelSegment(bool isFirst) {
-  if (!isFirst) {
-    integrateWristEndOfSegment();
-  }
-
-  const TrajectoryPoint p = trajBuffer[trajHead];
-  trajHead = (trajHead + 1) % TRAJ_BUFFER_POINTS;
-  trajBufferedCount--;
-
-  dispatchVelocityPoint(p);
-}
-
 void processVelocityMode() {
   bool timeUp = velSegmentActive && (millis() >= velSegmentEndMs);
-
-  // Start draining when queue has enough to prime (or continue after re-prime).
-  if (!velModeRunning && trajBufferedCount >= VEL_MODE_START_BUFFER) {
-    dequeueAndApplyVelSegment(true);
-    velModeRunning = true;
-    velRxLinePending = false;
-    return;
-  }
-
   if (!velModeRunning) {
+    // No active segment: stay stopped until a velocity row arrives.
     stopSteppersVelocity();
     velSegmentActive = false;
-    velRxLinePending = false;
     return;
   }
 
-  // Advance to next queued segment: timer (vel_time) or new line (whichever fires first).
-  if (velSegmentActive && trajBufferedCount > 0 && (timeUp || velRxLinePending)) {
-    dequeueAndApplyVelSegment(false);
-    velRxLinePending = false;
-    return;
-  }
-
-  // Last segment: queue empty; run until segment timer expires, then stop and re-prime.
-  if (velSegmentActive && trajBufferedCount == 0 && timeUp) {
+  // If no new velocity row arrives, end the current segment on timer.
+  if (timeUp) {
     integrateWristEndOfSegment();
     stopSteppersVelocity();
     velSegmentActive = false;
     velModeRunning = false;
     velSegVel5DegPerSec = 0.0f;
     velSegVel6DegPerSec = 0.0f;
-    velRxLinePending = false;
     Serial.println("FINISHED");
     return;
   }
-
-  velRxLinePending = false;
 }
  
  //////////////////////////////
@@ -514,7 +471,6 @@ bool handleModeCommand(const String& line) {
     velocityModeEnabled = false;
     velModeRunning = false;
     velSegmentActive = false;
-    velRxLinePending = false;
     velSegVel5DegPerSec = 0.0f;
     velSegVel6DegPerSec = 0.0f;
     stopSteppersVelocity();
@@ -540,29 +496,13 @@ bool handleModeCommand(const String& line) {
   velocityModeEnabled = true;
   velModeRunning = false;
   velSegmentActive = false;
-  velRxLinePending = false;
   Serial.print("MODE: VEL ");
   Serial.print(velocityModeTimeMs);
   Serial.println("ms");
   return true;
 }
 
-void enqueueTrajectoryPoint(const TrajectoryPoint& p) {
-  trajBuffer[trajTail] = p;
-  trajTail = (trajTail + 1) % TRAJ_BUFFER_POINTS;
-  trajBufferedCount++;
-
-  if (!isExecutingTrajectory) {
-    finishedFlagSent = false;
-  }
-}
-
  void loadTrajectoryRow(const String& line) {
-   if (trajBufferedCount >= TRAJ_BUFFER_POINTS) {
-     Serial.println("ERR: buffer full");
-     return;
-   }
- 
    float values[13];
    if (!parseFloatLine(line, values, 13)) {
      Serial.println("ERR: row must have 13 numbers");
@@ -575,16 +515,13 @@ void enqueueTrajectoryPoint(const TrajectoryPoint& p) {
      p.velocityDeg[i] = values[i + 6];
    }
    p.gripperPos = values[12];
- 
-  enqueueTrajectoryPoint(p);
+
+  dispatchTrajectoryPoint(p);
+  isExecutingTrajectory = true;
+  finishedFlagSent = false;
 }
 
 void loadVelocityRow(const String& line) {
-  if (trajBufferedCount >= TRAJ_BUFFER_POINTS) {
-    Serial.println("ERR: buffer full");
-    return;
-  }
-
   float values[7];
   if (!parseFloatLine(line, values, 7)) {
     Serial.println("ERR: velocity row must have 7 numbers");
@@ -601,8 +538,12 @@ void loadVelocityRow(const String& line) {
   }
   p.gripperPos = values[6];
 
-  enqueueTrajectoryPoint(p);
-  velRxLinePending = true;
+  // If a segment is already active, integrate up to "now" before updating command.
+  if (velSegmentActive) {
+    integrateWristEndOfSegment();
+  }
+  dispatchVelocityPoint(p);
+  velModeRunning = true;
  }
  
  void dispatchTrajectoryPoint(const TrajectoryPoint& p) {
