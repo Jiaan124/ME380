@@ -143,7 +143,7 @@
     <visual>
       <origin rpy="0 0 0" xyz="0 0 -0.056"/>
       <geometry>
-        <box size=" 0.03 0.03 0.112"/>
+        <box size=" 0.03 0.03 0.207"/>
       </geometry>
       <material name="dark_grey">
         <color rgba="0.3 0.3 0.3 1"/>

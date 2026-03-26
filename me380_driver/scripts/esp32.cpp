@@ -173,13 +173,13 @@
    pinMode(STEPPER_ENABLE, OUTPUT);
    digitalWrite(STEPPER_ENABLE, LOW);   // Enable drivers
  
-   stepper1.setMaxSpeed(3000);
+   stepper1.setMaxSpeed(4000);
  
-   stepper2.setMaxSpeed(3000);
+   stepper2.setMaxSpeed(10000);
  
-   stepper3.setMaxSpeed(3000);
+   stepper3.setMaxSpeed(10000);
  
-   stepper4.setMaxSpeed(3000);
+   stepper4.setMaxSpeed(4000);
  
    servoA.attach(SERVO_A_PIN);
    servoB.attach(SERVO_B_PIN);
