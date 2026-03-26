@@ -145,7 +145,7 @@ class ikNode(Node):
         )
 
         #toggle between joint space command and cartesian space command
-        self.declare_parameter("joint_space", True)
+        self.declare_parameter("joint_space", False)
         self.joint_space = self.get_parameter("joint_space").value
         # self.timer = self.create_timer(0.02, self.timer_callback) #50hz control loop
 
@@ -162,115 +162,11 @@ class ikNode(Node):
         self._bridge_set_params_client = None
         print("ik node running")
 
-    def _esp32_bridge_set_parameters_service_name(self) -> str:
-        """Resolve ~/set_parameters for esp_32_bridge (same namespace as this node)."""
-        ns = self.get_namespace()
-        if ns == "/":
-            return f"/{ESP32_BRIDGE_NODE_NAME}/set_parameters"
-        return f"{ns}/{ESP32_BRIDGE_NODE_NAME}/set_parameters"
-
-    @staticmethod
-    def _param_bool(name: str, value: bool) -> ParameterMsg:
-        p = ParameterMsg()
-        p.name = name
-        p.value = ParameterValue(
-            type=ParameterType.PARAMETER_BOOL,
-            bool_value=bool(value),
-        )
-        return p
-
-    @staticmethod
-    def _param_int(name: str, value: int) -> ParameterMsg:
-        p = ParameterMsg()
-        p.name = name
-        p.value = ParameterValue(
-            type=ParameterType.PARAMETER_INTEGER,
-            integer_value=int(value),
-        )
-        return p
-
-    def _bridge_set_params_client_lazy(self):
-        if self._bridge_set_params_client is None:
-            self._bridge_set_params_client = self.create_client(
-                SetParameters,
-                self._esp32_bridge_set_parameters_service_name(),
-            )
-        return self._bridge_set_params_client
-
-    def _call_bridge_set_parameters(self, params: list) -> bool:
-        client = self._bridge_set_params_client_lazy()
-        if not client.wait_for_service(timeout_sec=2.0):
-            self.get_logger().warn(
-                "esp_32_bridge set_parameters service not available; start esp_32_bridge first."
-            )
-            return False
-        req = SetParameters.Request()
-        req.parameters = params
-        future = client.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
-        if not future.done():
-            self.get_logger().warn("Timed out calling esp_32_bridge set_parameters.")
-            return False
-        resp = future.result()
-        if not all(r.successful for r in resp.results):
-            self.get_logger().warn(
-                "esp_32_bridge rejected parameters: %s"
-                % [r.reason for r in resp.results if not r.successful]
-            )
-            return False
-        return True
-
     def _stamp_joint_state(self, js: JointState) -> None:
         """Set header.stamp to current ROS time (for joint_angles subscribers)."""
         js.header.stamp = self.get_clock().now().to_msg()
 
-    def _cancel_trajectory_timer(self) -> None:
-        if self._traj_timer is not None:
-            self._traj_timer.cancel()
-            self._traj_timer = None
-
-    def _set_esp32_bridge_vel_mode(self, vel_time_ms: int) -> None:
-        """Put esp_32_bridge in velocity streaming mode; vel_time_ms matches Cartesian dt."""
-        vel_time_ms = max(1, int(vel_time_ms))
-        self._call_bridge_set_parameters(
-            [
-                self._param_bool("vel_mode", True),
-                self._param_int("vel_time_ms", vel_time_ms),
-            ]
-        )
-
-    def _set_esp32_bridge_traj_mode(self) -> None:
-        """Restore esp_32_bridge trajectory (13-float) streaming."""
-        self._call_bridge_set_parameters([self._param_bool("vel_mode", False)])
-
-    def _fill_joint_state_traj_row(self, out: JointState, row_idx: int) -> None:
-        """Set position from _traj_rows[row_idx]; optional joint velocities for vel_mode bridge."""
-        out.position = self._traj_rows[row_idx]
-        if not self._publish_joint_velocities:
-            return
-        period = max(float(self._traj_period_s), 1e-6)
-        q_curr = self._traj_rows[row_idx][:6]
-        if row_idx == 0:
-            q_act = list(self.current_position[1:7])
-            out.velocity = [(q_curr[j] - q_act[j]) / period for j in range(6)]
-        else:
-            q_prev = self._traj_rows[row_idx - 1][:6]
-            out.velocity = [(q_curr[j] - q_prev[j]) / period for j in range(6)]
-
-    def _traj_timer_callback(self) -> None:
-        if self._traj_idx >= len(self._traj_rows):
-            self._cancel_trajectory_timer()
-            return
-        out = JointState()
-        self._stamp_joint_state(out)
-        self._fill_joint_state_traj_row(out, self._traj_idx)
-        self.publisher_.publish(out)
-        self._traj_idx += 1
-        if self._traj_idx >= len(self._traj_rows):
-            self._cancel_trajectory_timer()
-
     def destroy_node(self) -> None:
-        self._cancel_trajectory_timer()
         super().destroy_node()
 
     def actual_state_callback(self, msg):
@@ -284,8 +180,6 @@ class ikNode(Node):
         self.joint_space = self.get_parameter("joint_space").value
 
         if self.joint_space: #move in joint space to target orientation
-            self._publish_joint_velocities = False
-            self._set_esp32_bridge_traj_mode()
             #should only need to give end position because velocity is linear
             seed = self.current_position if self.current_position is not None else self.ik
             self.ik = self.my_chain.inverse_kinematics(
@@ -305,9 +199,7 @@ class ikNode(Node):
 
     def xyz_targ_callback(self, msg):
         if len(msg.data) != 3:
-            self.get_logger().warn(
-                "invalid Cartesian delta, expected 3 floats (dx dy dz in meters)"
-            )
+            self.get_logger().warn("invalid target position, expected 3 floats (x y z in meters)")
             return
 
         self.joint_space = self.get_parameter("joint_space").value
@@ -319,65 +211,58 @@ class ikNode(Node):
 
         v_max = float(self.get_parameter("cartesian_linear_velocity_m_s").value)
         dt = float(self.get_parameter("cartesian_sample_period_s").value)
-        accel = float(self.get_parameter("cartesian_linear_accel_m_s2").value)
+        # accel = float(self.get_parameter("cartesian_linear_accel_m_s2").value)
 
-        vel_time_ms = max(1, int(round(dt * 1000.0)))
-        self._set_esp32_bridge_vel_mode(vel_time_ms)
-        self._publish_joint_velocities = True
-        self._traj_period_s = max(dt, 1e-6)
-
-        delta_cmd = np.array(msg.data[:3], dtype=float)
-        seed = self.current_position if self.current_position is not None else self.ik
+        # target_xyz = np.array(msg.data[:3], dtype=float)
+        target_xyz = np.array([0.35, 0.0, 0.15]) #0, 0.436, -0.804
+        # seed = self.current_position if self.current_position is not None else self.ik
+        seed = [0, 0, 0.8212, -1.6, 0, -0.793, 0, 0]  #0.25, 0, 0.15
         fk0 = self.my_chain.forward_kinematics(seed)
         current_xyz = np.array(fk0[:3, 3], dtype=float).reshape(3)
-        target_xyz = current_xyz + delta_cmd
+        # current_xyz = np.array([0.4, 0.0, 0.2])
+        delta_xyz = target_xyz - current_xyz
         self.get_logger().info(
-            f"xyz move (relative): current={current_xyz.tolist()} "
-            f"delta={delta_cmd.tolist()} -> target={target_xyz.tolist()} "
-            f"|delta|={float(np.linalg.norm(delta_cmd)):.4f} m"
+            f"xyz move: current={current_xyz.tolist()} target={target_xyz.tolist()} "
+            f"delta_norm={float(np.linalg.norm(delta_xyz)):.4f} m"
         )
 
-        # (N, 3) waypoints in meters; trapezoidal speed along the segment (not scipy — see module doc).
-        samples = cartesian_line_samples(current_xyz, target_xyz, v_max, accel, dt)
-        n = samples.shape[0]
-        print(samples)
+        #fin total distance
+        distance = np.linalg.norm(delta_xyz) 
 
-        fk = fk0
-        target_orientation = fk[:3, :3]
-        joint_cols = np.zeros((6, n), dtype=float)
-        q_full = list(seed)
+        if distance > 0:
+            unit_direction = delta_xyz / distance
+        else:
+            unit_direction = np.zeros(3)
 
-        for i in range(n):
-            pt = samples[i]
-            q_full = self.my_chain.inverse_kinematics(
-                pt,
+
+        num_samples = int(distance / v_max/ dt)
+        waypoints = np.array([current_xyz])
+
+        #create 2d array of all inbetween positions
+        for i in range(1, num_samples+1):
+            next_point = current_xyz + i * v_max * dt *unit_direction    
+            waypoints = np.vstack((waypoints, next_point))
+
+        waypoints = np.vstack((waypoints, target_xyz)) #make sure to take care of any rounding errors
+        print(waypoints)
+
+        target_orientation = fk0[:3, :3]
+        joint_cols = np.empty((0, 6))
+        for i in range(waypoints.shape[0]):
+            xyz_coord = waypoints[i]
+            joint_angles = self.my_chain.inverse_kinematics(
+                xyz_coord,
                 target_orientation,
                 orientation_mode="all",
-                initial_position=q_full,
+                initial_position=seed,
             )
-            self.ik = q_full
-            joint_cols[:, i] = np.array(q_full[1:7], dtype=float)
+            seed = joint_angles
+            joint_cols = np.vstack((joint_cols, np.array(joint_angles[1:7], dtype=float)))
+        print(joint_cols)
+        print(waypoints.shape, joint_cols.shape)
 
-        grip = 0.0
-        self._traj_rows = [
-            [float(joint_cols[j, k]) for j in range(6)] + [grip] for k in range(n)
-        ]
-
-        self._cancel_trajectory_timer()
-        self._traj_idx = 0
-        period = max(dt, 1e-6)
-        if self._traj_rows:
-            out0 = JointState()
-            self._stamp_joint_state(out0)
-            self._fill_joint_state_traj_row(out0, 0)
-            self.publisher_.publish(out0)
-            self._traj_idx = 1
-        if self._traj_idx < len(self._traj_rows):
-            self._traj_timer = self.create_timer(period, self._traj_timer_callback)
-        self.get_logger().info(
-            f"Publishing {n} joint waypoint(s) on 'joint_states' at {1.0/period:.1f} Hz "
-            f"(v={v_max} m/s, a={accel} m/s², dt={dt} s)"
-        )
+        gripper_pos = 0.0
+        
 
 
 def main(args=None):
