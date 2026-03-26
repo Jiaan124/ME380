@@ -45,7 +45,7 @@ class ikNode(Node):
         self.filepath = self.get_parameter("filepath").value
         self.publisher_ = self.create_publisher(JointState, "joint_states", 10) #message type, topic name, buffer size
         self.declare_parameter("cartesian_linear_velocity_m_s", 0.02)
-        self.declare_parameter("cartesian_sample_period_s", 0.02)
+        self.declare_parameter("cartesian_sample_period_s", 0.5)
         self.declare_parameter("cartesian_linear_accel_m_s2", 0.2)
         self.sub = self.create_subscription(  #take in x, y, z and euler angles? or should it take in x y z and rotation matrix?
             Float64MultiArray,  #data type
@@ -137,11 +137,7 @@ class ikNode(Node):
         current_xyz = np.array(fk0[:3, 3], dtype=float).reshape(3)
         # current_xyz = np.array([0.4, 0.0, 0.2])
         delta_xyz = target_xyz - current_xyz
-        self.get_logger().info(
-            f"xyz move: current={current_xyz.tolist()} target={target_xyz.tolist()} "
-            f"delta_norm={float(np.linalg.norm(delta_xyz)):.4f} m"
-            f"seed={seed[1:7]}"
-        )
+
 
         #fin total distance
         distance = np.linalg.norm(delta_xyz) 
@@ -161,7 +157,8 @@ class ikNode(Node):
             waypoints = np.vstack((waypoints, next_point))
 
         waypoints = np.vstack((waypoints, target_xyz)) #make sure to take care of any rounding errors
-        print(waypoints)
+        # print(waypoints)
+
 
         target_orientation = fk0[:3, :3]
         joint_cols = np.empty((0, 6))
@@ -175,8 +172,25 @@ class ikNode(Node):
             )
             seed = joint_angles
             joint_cols = np.vstack((joint_cols, np.array(joint_angles[1:7], dtype=float)))
-        print(joint_cols)
+        # print(joint_cols)
         print(waypoints.shape[0], joint_cols.shape[0])
+
+        joint_vels = np.empty((0, 6))
+        for i in range(joint_cols.shape[0]-1):
+            joint_vels = np.vstack((joint_vels, (joint_cols[i+1] - joint_cols[i]) / dt))
+
+        self.get_logger().info(
+            f"xyz start/end:\n"
+            f"  current={current_xyz.tolist()}\n"
+            f"  target={target_xyz.tolist()}\n"
+            f"joint start/end:\n"
+            f"  start={joint_cols[0].tolist()}\n"
+            f"  end={joint_cols[-1].tolist()}\n"
+            f"delta_norm={float(np.linalg.norm(delta_xyz)):.4f} m"
+            # f"seed={seed[1:7]}"
+        )
+
+        print(joint_vels)
 
         gripper_pos = 0.0
         
@@ -188,8 +202,12 @@ class ikNode(Node):
             self._stamp_joint_state(out)
             out.position = joint_cols[i].tolist()
             out.position.append(0.9) #TODO: CHANGE THIS> THIS ONLY EXISTS BECAUSE IM LAZY TO DO GRIPPER
+            if i < joint_cols.shape[0]-1:
+                out.velocity = joint_vels[i].tolist()
+            
+                # out.velocity = [0.0] * 6
             self.publisher_.publish(out)
-            print(joint_cols[i])
+            # print(joint_cols[i])
             next_time += dt
             sleep_time = next_time - time.time()        
             if sleep_time > 0:

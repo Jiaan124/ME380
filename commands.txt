@@ -7,28 +7,30 @@ colcon build --packages-select me380_driver --symlink-install
 
 docker exec -it me380 /bin/bash
 
-#Direct control stuff
+                    #Direct control stuff
 ros2 param set /esp_32_bridge vel_mode true
 ros2 param set /esp_32_bridge vel_time_ms 200
 ros2 service call /zero_steppers std_srvs/srv/Trigger "{}"
 ros2 topic pub -1 /joint_states sensor_msgs/msg/JointState "{header: {frame_id: ''}, position: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}"
 ros2 topic pub -1 /joint_states sensor_msgs/msg/JointState "{header: {frame_id: ''}, position: [0.0, 0.2, -0.2, 0.0, 0.0, 0.0, 0.0]}"
 
-#0.25, 0, 0.15, 0, 0, 90 cartesian coords
-ros2 topic pub -1 /joint_states sensor_msgs/msg/JointState "{header: {frame_id: ''}, position: [0.0, 0.8211, -1.599, 0.0, -0.793, 0.0, 1]}"
+#0.25, 0, 0.2, 0, 0, 90 cartesian coords
+ros2 topic pub -1 /joint_states sensor_msgs/msg/JointState "{header: {frame_id: ''}, position: [0.0, 0.95589, -1.5513, 0.0, -0.9753, 0.0, 1]}"
 
 #
 ros2 topic pub -1 /joint_states sensor_msgs/msg/JointState "{header: {frame_id: ''}, position: [0.0, 0.523, -0.735, 0.0, -1.04,0.0, 0.0]}"
 
 
-#publish ik pose
+                    #publish ik pose
 
-
+#straght line
 ros2 topic pub --once /target_position_joint_space std_msgs/msg/Float64MultiArray "{data: [0.4983, 0, 0.2391, 0.0, -90.0, 0.0]}"
 ros2 topic pub --once /target_position_joint_space std_msgs/msg/Float64MultiArray "{data: [0.35, 0, 0.2, 0.0, 0.0, 90.0]}"
 
 ros2 topic pub -r 50 -t 100 /target_position_joint_space std_msgs/msg/Float64MultiArray "{data: [-0.4, 0.1, 0.05, 45.0, 45.0, 45.0]}"
 
+
+                    #Linear move
  ros2 param set /ik joint_space false
 ros2 topic pub --once /target_position_xyz_space std_msgs/msg/Float64MultiArray "{data: [0.3, 0.0, 0.2]}"
 

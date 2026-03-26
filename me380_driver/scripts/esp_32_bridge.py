@@ -18,7 +18,7 @@ DEG_TO_RAD = math.pi / 180.0
 JOINT_STATE_TOPIC = "joint_states"
 JOINT_FEEDBACK_TOPIC = "actual_joint_position"
 
-SERIAL_PORT = "/dev/ttyACM0"
+SERIAL_PORT = "/dev/ttyACM1"
 SERIAL_BAUD = 250000
 SERIAL_TIMEOUT_S = 0.01
 SERIAL_STARTUP_DELAY_S = 2.0
@@ -29,14 +29,14 @@ FEEDBACK_RATE_HZ = 50.0
 
 # Direction multipliers applied at the bridge layer for J1..J6.
 # Set J3 to -1.0 to reverse its hardware direction.
-JOINT_DIRECTION = [1.0, -1.0, -1.0, 1.0, 1.0, -1.0]
+JOINT_DIRECTION = [1.0, -1.0, -1.0, 1.0, -1.0, -1.0]
 
 # Max joint velocity limits [J1..J6] in deg/s for bridge-side clipping.
 MAX_JOINT_VELOCITY_DEG_S = [
-    0.3 * RAD_TO_DEG,
-    0.5 * RAD_TO_DEG,
-    0.5 * RAD_TO_DEG,
-    0.5 * RAD_TO_DEG,
+    1 * RAD_TO_DEG,
+    1 * RAD_TO_DEG,
+    1 * RAD_TO_DEG,
+    0.6 * RAD_TO_DEG,
     0.5 * RAD_TO_DEG,
     0.5 * RAD_TO_DEG,
 ]
@@ -112,7 +112,7 @@ class Esp32BridgeNode(Node):
         # Absolute home pose in hardware frame (deg) for [J1..J6].
         # Firmware expects J1..J4 as deltas and J5..J6 as absolute angles.
         home_pose_abs_deg = [0, 142.48, 56.84, 0, 70.67, 0.0]
-        stepper_hardstop_deg = [170, -5, 100,  170]
+        stepper_hardstop_deg = [170, -5, 100,  -170]
         # Command to firmware: J1..J4 are DELTAS from the hardstop coordinate.
         stepper_delta_deg = [
             home_pose_abs_deg[i] - stepper_hardstop_deg[i] for i in range(4)
@@ -235,6 +235,8 @@ class Esp32BridgeNode(Node):
         except Exception as exc:
             self.get_logger().error("Serial read failed: %s" % str(exc))
 
+    
+
     def _on_joint_states(self, msg: JointState) -> None:
         npos = len(msg.position)
         if npos < 6:
@@ -256,6 +258,14 @@ class Esp32BridgeNode(Node):
                 gripper_deg = self._target_deg[6]
 
         incoming_deg.append(gripper_deg)
+        has_velocity = len(msg.velocity) == 6
+        incoming_vel_deg_s = [0.0] * 6
+        if has_velocity:
+            # Convert ROS frame (rad/s) -> hardware frame (deg/s), including joint direction.
+            incoming_vel_deg_s = [
+                float(msg.velocity[i]) * RAD_TO_DEG * JOINT_DIRECTION[i]
+                for i in range(6)
+            ]
 
         with self._state_lock:
             now = time.monotonic()
@@ -268,16 +278,19 @@ class Esp32BridgeNode(Node):
                 current = self._state_deg[idx]
                 target = incoming_deg[idx]
                 delta = target - current
-                vel_needed = delta / CONTROL_DT_S
-
                 vel_limit = MAX_JOINT_VELOCITY_DEG_S[idx]
-                vel_cmd = vel_needed
-                if abs(vel_needed) > vel_limit:
-                    vel_cmd = math.copysign(vel_limit, vel_needed)
+                if has_velocity:
+                    vel_cmd = incoming_vel_deg_s[idx]
+                else:
+                    # Simple default: move toward target at half max speed.
+                    vel_cmd = (vel_limit / 2.0) * (math.copysign(1.0, delta) if delta != 0.0 else 0.0)
+
+                if abs(vel_cmd) > vel_limit:
                     self.get_logger().warn(
                         "J%d velocity %.2f deg/s exceeds max %.2f deg/s; clipping."
-                        % (idx + 1, vel_needed, vel_limit)
+                        % (idx + 1, vel_cmd, vel_limit)
                     )
+                    vel_cmd = math.copysign(vel_limit, vel_cmd)
 
                 frame_pos[idx] = delta
                 frame_vel[idx] = vel_cmd
@@ -287,16 +300,21 @@ class Esp32BridgeNode(Node):
             for idx in range(4, 6):
                 current = self._state_deg[idx]
                 target = incoming_deg[idx]
-                vel_needed = (target - current) / CONTROL_DT_S
+                delta = target - current
 
                 vel_limit = MAX_JOINT_VELOCITY_DEG_S[idx]
-                vel_cmd = vel_needed
-                if abs(vel_needed) > vel_limit:
-                    vel_cmd = math.copysign(vel_limit, vel_needed)
+                if has_velocity:
+                    vel_cmd = incoming_vel_deg_s[idx]
+                else:
+                    # Simple default: move toward target at half max speed.
+                    vel_cmd = (vel_limit / 2.0) * (math.copysign(1.0, delta) if delta != 0.0 else 0.0)
+
+                if abs(vel_cmd) > vel_limit:
                     self.get_logger().warn(
                         "J%d velocity %.2f deg/s exceeds max %.2f deg/s; clipping."
-                        % (idx + 1, vel_needed, vel_limit)
+                        % (idx + 1, vel_cmd, vel_limit)
                     )
+                    vel_cmd = math.copysign(vel_limit, vel_cmd)
 
                 frame_pos[idx] = target
                 frame_vel[idx] = vel_cmd
