@@ -18,7 +18,7 @@ DEG_TO_RAD = math.pi / 180.0
 JOINT_STATE_TOPIC = "joint_states"
 JOINT_FEEDBACK_TOPIC = "actual_joint_position"
 
-SERIAL_PORT = "/dev/ttyACM0"
+SERIAL_PORT = "/dev/ttyACM1"
 SERIAL_BAUD = 115200
 SERIAL_TIMEOUT_S = 0.01
 SERIAL_STARTUP_DELAY_S = 2.0
@@ -28,12 +28,12 @@ FEEDBACK_RATE_HZ = 50.0
 
 # Direction multipliers applied at the bridge layer for J1..J6.
 # Set J3 to -1.0 to reverse its hardware direction.
-JOINT_DIRECTION = [1.0, 1.0, -1.0, 1.0, 1.0, 1.0]
+JOINT_DIRECTION = [1.0, -1.0, -1.0, 1.0, 1.0, 1.0]
 
 # Max joint velocity limits [J1..J6] in deg/s for bridge-side clipping.
 MAX_JOINT_VELOCITY_DEG_S = [
     0.5 * RAD_TO_DEG,
-    1.0 * RAD_TO_DEG,
+    2.0 * RAD_TO_DEG,
     1.0 * RAD_TO_DEG,
     0.5 * RAD_TO_DEG,
     0.5 * RAD_TO_DEG,
@@ -61,7 +61,6 @@ class Esp32BridgeNode(Node):
 
         # Open-loop state estimate (degrees): [J1..J6, gripper]
         self._state_deg: List[float] = [0.0] * 7
-        self.stepper_hardstop = [2.96706, -0.08727, 1.74533,  2.61799]
         self._target_deg: List[float] = [0.0] * 7
         self._cmd_vel_deg_s: List[float] = [0.0] * 6
         self._last_cmd_time = time.monotonic()
@@ -97,20 +96,44 @@ class Esp32BridgeNode(Node):
         )
 
     def zero_steppers_callback(self, request, response):
-            self.get_logger().info('Received request to zero all steppers...')
-            
-            try:
-                self._state_deg[0:4] = self.stepper_hardstop
-                self.get_logger().info('Steppers zeroed out.')
-
-                home_pose = [0, 2.48689, 0.992, 0, 1.233, 0.0, GRIPPER_MAX_DEG]
-                
-
-            except Exception as e:
-                response.success = False
-                response.message = f"Failed to zero steppers: {str(e)}"
-                
+        self.get_logger().info('Received request to zero all steppers...')
+        if self._vel_mode:
+            response.success = False
+            response.message = "Cannot zero steppers in velocity mode."
             return response
+
+        if self._serial is None:
+            response.success = False
+            response.message = "Serial link not connected."
+            return response
+
+        # Absolute home pose in hardware frame (deg) for [J1..J6].
+        # Firmware expects J1..J4 as deltas and J5..J6 as absolute angles.
+        home_pose_abs_deg = [0, 142.48, 56.84, 0, 70.67, 0.0]
+        stepper_hardstop_deg = [170, -5, 100,  170]
+        # Command to firmware: J1..J4 are DELTAS from the hardstop coordinate.
+        stepper_delta_deg = [
+            home_pose_abs_deg[i] - stepper_hardstop_deg[i] for i in range(4)
+        ]
+        traj_frame = stepper_delta_deg + home_pose_abs_deg[4:6]
+        traj_frame = [traj_frame[i] * JOINT_DIRECTION[i] for i in range(6)]
+
+        # Jump feedback to the home pose: update bridge open-loop state now.
+        # This makes the next feedback timer tick publish home immediately.
+        with self._state_lock:
+            self._state_deg[0:6] = home_pose_abs_deg
+            self._state_deg[6] = GRIPPER_MAX_DEG
+            self._target_deg[0:6] = home_pose_abs_deg
+            self._target_deg[6] = GRIPPER_MAX_DEG
+            for i in range(6):
+                self._cmd_vel_deg_s[i] = 0.0
+            self._last_cmd_time = time.monotonic()
+
+        self.get_logger().info('Steppers zeroed out; jumping feedback to home pose.')
+        self._send_traj_frame(traj_frame, MAX_JOINT_VELOCITY_DEG_S, GRIPPER_MAX_DEG)
+        response.success = True
+        response.message = "Commanded home pose (feedback jumped to home)."
+        return response
 
     def _on_set_parameters(self, params: List[Parameter]) -> SetParametersResult:
         for p in params:
