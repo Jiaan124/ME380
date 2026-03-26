@@ -21,7 +21,7 @@
   <!-- Cross-section thickness for arm links -->
   <xacro:property name="thick" value="0.03"/>
   <!-- Height and offset of slanted shoulder-->
-  <xacro:property name="link1_height" value="0.2391"/>
+  <xacro:property name="link1_height" value="0.245"/>
   <xacro:property name="link1_side_offset" value="-0.0622"/>
 
   <!-- Elbow (middle piece) length -->

@@ -48,7 +48,7 @@
     <visual>
       <origin rpy="0 0 0" xyz="0 0 0.11955"/>
       <geometry>
-        <box size="0.03 0.03 0.2391"/>
+        <box size="0.03 0.03 0.245"/>
       </geometry>
       <material name="blue">
         <color rgba="0.2 0.4 0.8 1"/>
