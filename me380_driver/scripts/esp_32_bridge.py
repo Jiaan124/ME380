@@ -19,7 +19,7 @@ JOINT_STATE_TOPIC = "joint_states"
 JOINT_FEEDBACK_TOPIC = "actual_joint_position"
 
 SERIAL_PORT = "/dev/ttyACM0"
-SERIAL_BAUD = 115200
+SERIAL_BAUD = 250000
 SERIAL_TIMEOUT_S = 0.01
 SERIAL_STARTUP_DELAY_S = 2.0
 SERIAL_READ_POLL_S = 0.02
@@ -29,13 +29,13 @@ FEEDBACK_RATE_HZ = 50.0
 
 # Direction multipliers applied at the bridge layer for J1..J6.
 # Set J3 to -1.0 to reverse its hardware direction.
-JOINT_DIRECTION = [1.0, -1.0, -1.0, 1.0, 1.0, 1.0]
+JOINT_DIRECTION = [1.0, -1.0, -1.0, 1.0, 1.0, -1.0]
 
 # Max joint velocity limits [J1..J6] in deg/s for bridge-side clipping.
 MAX_JOINT_VELOCITY_DEG_S = [
+    0.3 * RAD_TO_DEG,
     0.5 * RAD_TO_DEG,
-    2.0 * RAD_TO_DEG,
-    1.0 * RAD_TO_DEG,
+    0.5 * RAD_TO_DEG,
     0.5 * RAD_TO_DEG,
     0.5 * RAD_TO_DEG,
     0.5 * RAD_TO_DEG,
