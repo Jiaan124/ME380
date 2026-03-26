@@ -131,8 +131,8 @@ class ikNode(Node):
 
         target_xyz = np.array(msg.data[:3], dtype=float)
         # target_xyz = np.array([0.35, 0.0, 0.15]) #0, 0.436, -0.804
-        # seed = self.current_position if self.current_position is not None else self.ik
-        seed = [0, 0, 0.8212, -1.6, 0, -0.793, 0, 0]  #0.25, 0, 0.15
+        seed = self.current_position if self.current_position is not None else self.ik_init
+        # seed = [0, 0, 0.8212, -1.6, 0, -0.793, 0, 0]  #0.25, 0, 0.15
         fk0 = self.my_chain.forward_kinematics(seed)
         current_xyz = np.array(fk0[:3, 3], dtype=float).reshape(3)
         # current_xyz = np.array([0.4, 0.0, 0.2])
@@ -140,6 +140,7 @@ class ikNode(Node):
         self.get_logger().info(
             f"xyz move: current={current_xyz.tolist()} target={target_xyz.tolist()} "
             f"delta_norm={float(np.linalg.norm(delta_xyz)):.4f} m"
+            f"seed={seed[1:7]}"
         )
 
         #fin total distance
@@ -186,7 +187,7 @@ class ikNode(Node):
             out = JointState()
             self._stamp_joint_state(out)
             out.position = joint_cols[i].tolist()
-            out.position.append(0) #TODO: CHANGE THIS> THIS ONLY EXISTS BECAUSE IM LAZY TO DO GRIPPER
+            out.position.append(0.9) #TODO: CHANGE THIS> THIS ONLY EXISTS BECAUSE IM LAZY TO DO GRIPPER
             self.publisher_.publish(out)
             print(joint_cols[i])
             next_time += dt

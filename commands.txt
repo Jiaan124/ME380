@@ -13,6 +13,11 @@ ros2 param set /esp_32_bridge vel_time_ms 200
 ros2 service call /zero_steppers std_srvs/srv/Trigger "{}"
 ros2 topic pub -1 /joint_states sensor_msgs/msg/JointState "{header: {frame_id: ''}, position: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}"
 ros2 topic pub -1 /joint_states sensor_msgs/msg/JointState "{header: {frame_id: ''}, position: [0.0, 0.2, -0.2, 0.0, 0.0, 0.0, 0.0]}"
+
+#0.25, 0, 0.15, 0, 0, 90 cartesian coords
+ros2 topic pub -1 /joint_states sensor_msgs/msg/JointState "{header: {frame_id: ''}, position: [0.0, 0.8211, -1.599, 0.0, -0.793, 0.0, 1]}"
+
+#
 ros2 topic pub -1 /joint_states sensor_msgs/msg/JointState "{header: {frame_id: ''}, position: [0.0, 0.523, -0.735, 0.0, -1.04,0.0, 0.0]}"
 
 

@@ -18,10 +18,11 @@ DEG_TO_RAD = math.pi / 180.0
 JOINT_STATE_TOPIC = "joint_states"
 JOINT_FEEDBACK_TOPIC = "actual_joint_position"
 
-SERIAL_PORT = "/dev/ttyACM1"
+SERIAL_PORT = "/dev/ttyACM0"
 SERIAL_BAUD = 115200
 SERIAL_TIMEOUT_S = 0.01
 SERIAL_STARTUP_DELAY_S = 2.0
+SERIAL_READ_POLL_S = 0.02
 
 CONTROL_DT_S = 0.02  # 20 ms
 FEEDBACK_RATE_HZ = 50.0
@@ -83,6 +84,7 @@ class Esp32BridgeNode(Node):
         )
         self._feedback_pub = self.create_publisher(JointState, JOINT_FEEDBACK_TOPIC, 10)
         self._feedback_timer = self.create_timer(1.0 / FEEDBACK_RATE_HZ, self._on_feedback_timer)
+        self._serial_rx_timer = self.create_timer(SERIAL_READ_POLL_S, self._poll_serial_rx)
 
         self.srv = self.create_service(
             Trigger, 
@@ -212,6 +214,27 @@ class Esp32BridgeNode(Node):
             self._serial = None
             self.get_logger().error("Failed to open serial %s: %s" % (SERIAL_PORT, str(exc)))
 
+    def _poll_serial_rx(self) -> None:
+        """Read and print any line-oriented messages from the ESP32."""
+        if self._serial is None:
+            return
+        try:
+            while self._serial.in_waiting > 0:
+                raw = self._serial.readline()
+                if not raw:
+                    break
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                if line.startswith("ERR"):
+                    self.get_logger().error("ESP32: %s" % line)
+                elif line.startswith("WARN"):
+                    self.get_logger().warn("ESP32: %s" % line)
+                else:
+                    self.get_logger().info("ESP32: %s" % line)
+        except Exception as exc:
+            self.get_logger().error("Serial read failed: %s" % str(exc))
+
     def _on_joint_states(self, msg: JointState) -> None:
         npos = len(msg.position)
         if npos < 6:
@@ -328,6 +351,9 @@ class Esp32BridgeNode(Node):
         self._feedback_pub.publish(msg)
 
     def destroy_node(self) -> bool:
+        if self._serial_rx_timer is not None:
+            self._serial_rx_timer.cancel()
+            self._serial_rx_timer = None
         if self._feedback_timer is not None:
             self._feedback_timer.cancel()
             self._feedback_timer = None
