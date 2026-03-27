@@ -125,8 +125,13 @@
  const double US_PER_DEG = 2000.0 / 270.0;
  
  const double SERVO_SPEED_US_PER_SEC = 400.0;
-const float DEFAULT_COMMAND_VEL_DEG_S = 30.0f;
+const float DEFAULT_COMMAND_VEL_DEG_S[6] = {20.0f, 20.0f, 40.0f, 30.0f, 30.0f, 30.0f};
+const float JOINT6_MANUAL_OFFSET_DEG = 10.0f;
  const int UPDATE_PERIOD_MS = 20;
+const int MAXREACH_WAYPOINT_COUNT = 8;
+const int TOPGRIP_WAYPOINT_COUNT = 4;
+const int FRONTGRIP_WAYPOINT_COUNT = 4;
+const int RIGHTGRIP_WAYPOINT_COUNT = 6;
  
  int currentPwmA = PWM_CENTER;
  int currentPwmB = PWM_CENTER;
@@ -151,12 +156,69 @@ const float DEFAULT_COMMAND_VEL_DEG_S = 30.0f;
  bool finishedFlagSent = false;
 // Internal commanded absolute state for steppers J1..J4 (deg).
 float commandedAbsDeg[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+enum ActiveSequenceType {
+  SEQ_NONE = 0,
+  SEQ_MAXREACH,
+  SEQ_TOPGRIP,
+  SEQ_FRONTGRIP,
+  SEQ_RIGHTGRIP
+};
+
+bool sequenceLoaded = false;
+int sequenceNextIndex = 0;
+ActiveSequenceType activeSequence = SEQ_NONE;
+const float (*activeWaypoints)[7] = nullptr;
+int activeWaypointCount = 0;
+const float maxreachWaypoints[MAXREACH_WAYPOINT_COUNT][7] = {
+  {-90.0f, 83.0f, -129.0f, 0.0f, -41.0f, 0.0f, 80.0f},
+  {-90.0f, 32.0f, -107.0f, 0.0f, 6.0f, 0.0f, 80.0f},
+  {-90.0f, 32.0f, -107.0f, 0.0f, 6.0f, 0.0f, 20.0f},
+  {-90.0f, 83.0f, -129.0f, 0.0f, 6.0f, 0.0f, 20.0f},
+  {90.0f, 83.0f, -129.0f, 0.0f, 6.0f, 0.0f, 20.0f},
+  {90.0f, 32.0f, -107.0f, 0.0f, 6.0f, 0.0f, 20.0f},
+  {90.0f, 32.0f, -107.0f, 0.0f, 6.0f, 0.0f, 80.0f},
+  {90.0f, 83.0f, -129.0f, 0.0f, 6.0f, 0.0f, 80.0f},
+};
+const float topgripWaypoints[TOPGRIP_WAYPOINT_COUNT][7] = {
+  {0.0f, 99.0f, -191.0f, 0.0f, -36.0f, 0.0f, 80.0f},
+  {0.0f, 88.0f, -194.0f, 0.0f, -52.0f, 0.0f, 80.0f},
+  {0.0f, 88.0f, -194.0f, 0.0f, -52.0f, 0.0f, 20.0f},
+  {0.0f, 99.0f, -191.0f, 0.0f, -36.0f, 0.0f, 20.0f},
+};
+const float frontgripWaypoints[FRONTGRIP_WAYPOINT_COUNT][7] = {
+  {0.0f, 99.0f, -191.0f, 0.0f, -36.0f, 0.0f, 80.0f},
+  {0.0f, 0.0f, -55.0f, 90.0f, 0.0f, 90.0f, 80.0f},
+  {0.0f, 0.0f, -55.0f, 90.0f, 0.0f, 90.0f, 20.0f},
+  {0.0f, 99.0f, -191.0f, 0.0f, -36.0f, 0.0f, 20.0f},
+};
+const bool frontgripHasCustomVel[FRONTGRIP_WAYPOINT_COUNT] = {
+  false, true, false, false
+};
+const float frontgripCustomVel[FRONTGRIP_WAYPOINT_COUNT][6] = {
+  {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+  {10.0f, 10.0f, 50.0f, 30.0f, 30.0f, 30.0f},
+  {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+  {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+};
+const float rightgripWaypoints[RIGHTGRIP_WAYPOINT_COUNT][7] = {
+  {0.0f, 99.0f, -191.0f, 0.0f, -36.0f, 0.0f, 80.0f},
+  {0.0f, 63.0f, -200.0f, -90.0f, -90.0f, 8.0f, 80.0f},
+  {0.0f, 48.7f, -191.3f, -90.0f, -90.0f, 0.0f, 80.0f},
+  {0.0f, 48.7f, -191.3f, -90.0f, -90.0f, 0.0f, 20.0f},
+  {0.0f, 63.0f, -200.0f, -90.0f, -90.0f, 8.0f, 20.0f},
+  {0.0f, 99.0f, -191.0f, 0.0f, -36.0f, 0.0f, 20.0f},
+};
  
  bool parseFloatLine(const String& line, float* values, int expectedCount);
  void handleSerialInput();
  void loadTrajectoryRow(const String& line);
 bool handleTextCommand(const String& line);
 void zeroPositionState();
+void loadMaxReachWaypoints();
+void loadTopGripWaypoints();
+void loadFrontGripWaypoints();
+void loadRightGripWaypoints();
+bool goToNextLoadedWaypoint();
  void dispatchTrajectoryPoint(const TrajectoryPoint& p);
 void moveSteppersAbsolute(float aJ1, float aJ2, float aJ3, float aJ4,
                    float vJ1, float vJ2, float vJ3, float vJ4);
@@ -361,6 +423,32 @@ bool handleTextCommand(const String& line) {
     Serial.println("OK: ZERO");
     return true;
   }
+  if (line == "MAXREACH") {
+    loadMaxReachWaypoints();
+    Serial.println("OK: MAXREACH loaded");
+    return true;
+  }
+  if (line == "TOPGRIP") {
+    loadTopGripWaypoints();
+    Serial.println("OK: TOPGRIP loaded");
+    return true;
+  }
+  if (line == "FRONTGRIP") {
+    loadFrontGripWaypoints();
+    Serial.println("OK: FRONTGRIP loaded");
+    return true;
+  }
+  if (line == "RIGHTGRIP") {
+    loadRightGripWaypoints();
+    Serial.println("OK: RIGHTGRIP loaded");
+    return true;
+  }
+  if (line == "go" || line == "GO") {
+    if (!goToNextLoadedWaypoint()) {
+      Serial.println("ERR: no waypoint to execute");
+    }
+    return true;
+  }
   return false;
 }
 
@@ -373,6 +461,64 @@ void zeroPositionState() {
   stepper2.setCurrentPosition(0);
   stepper3.setCurrentPosition(0);
   stepper4.setCurrentPosition(0);
+}
+
+void loadMaxReachWaypoints() {
+  sequenceLoaded = true;
+  sequenceNextIndex = 0;
+  activeSequence = SEQ_MAXREACH;
+  activeWaypoints = maxreachWaypoints;
+  activeWaypointCount = MAXREACH_WAYPOINT_COUNT;
+}
+
+void loadTopGripWaypoints() {
+  sequenceLoaded = true;
+  sequenceNextIndex = 0;
+  activeSequence = SEQ_TOPGRIP;
+  activeWaypoints = topgripWaypoints;
+  activeWaypointCount = TOPGRIP_WAYPOINT_COUNT;
+}
+
+void loadFrontGripWaypoints() {
+  sequenceLoaded = true;
+  sequenceNextIndex = 0;
+  activeSequence = SEQ_FRONTGRIP;
+  activeWaypoints = frontgripWaypoints;
+  activeWaypointCount = FRONTGRIP_WAYPOINT_COUNT;
+}
+
+void loadRightGripWaypoints() {
+  sequenceLoaded = true;
+  sequenceNextIndex = 0;
+  activeSequence = SEQ_RIGHTGRIP;
+  activeWaypoints = rightgripWaypoints;
+  activeWaypointCount = RIGHTGRIP_WAYPOINT_COUNT;
+}
+
+bool goToNextLoadedWaypoint() {
+  if (!sequenceLoaded || activeWaypoints == nullptr || sequenceNextIndex >= activeWaypointCount) {
+    return false;
+  }
+
+  TrajectoryPoint p;
+  for (int i = 0; i < 6; i++) {
+    p.absDeg[i] = activeWaypoints[sequenceNextIndex][i];
+    if (activeSequence == SEQ_FRONTGRIP && frontgripHasCustomVel[sequenceNextIndex]) {
+      p.velocityDeg[i] = frontgripCustomVel[sequenceNextIndex][i];
+    } else {
+      p.velocityDeg[i] = DEFAULT_COMMAND_VEL_DEG_S[i];
+    }
+  }
+  p.gripperPos = activeWaypoints[sequenceNextIndex][6];
+
+  dispatchTrajectoryPoint(p);
+  isExecutingTrajectory = true;
+  finishedFlagSent = false;
+
+  Serial.print("OK: GO ");
+  Serial.println(sequenceNextIndex);
+  sequenceNextIndex++;
+  return true;
 }
  
  void loadTrajectoryRow(const String& line) {
@@ -390,7 +536,7 @@ void zeroPositionState() {
    TrajectoryPoint p;
   for (int i = 0; i < 6; i++) {
     p.absDeg[i] = values[i];
-    p.velocityDeg[i] = parsed13 ? values[i + 7] : DEFAULT_COMMAND_VEL_DEG_S;
+    p.velocityDeg[i] = parsed13 ? values[i + 7] : DEFAULT_COMMAND_VEL_DEG_S[i];
   }
   p.gripperPos = values[6];
  
@@ -408,9 +554,11 @@ void zeroPositionState() {
      p.velocityDeg[0], p.velocityDeg[1], p.velocityDeg[2], p.velocityDeg[3]
    );
  
+  float commandedJ6WithOffset = p.absDeg[5] + JOINT6_MANUAL_OFFSET_DEG;
+
    // J5/J6: absolute positions. Joint 6 sign is flipped in the differential mix
    // (the composed sixth axis), not by inverting a single servo only.
-  moveDifferential(p.absDeg[4], -p.absDeg[5], p.velocityDeg[4], -p.velocityDeg[5]);
+  moveDifferential(p.absDeg[4], -commandedJ6WithOffset, p.velocityDeg[4], -p.velocityDeg[5]);
    moveEndEffector(p.gripperPos);
  }
  
