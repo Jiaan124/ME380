@@ -12,22 +12,30 @@
  *
  * SERIAL COMMAND PROTOCOL (streaming)
  *
- *   Host sends rows one at a time. Each row is exactly 13 floating-point
- *      values in this order:
+ *   Host sends rows one at a time. Supported formats:
  *
- *        [0..5]   Joint 1..6 "position" fields (degrees), interpreted as:
+ *     13-value row:
+ *        [0..5]   Joint 1..6 absolute position fields (degrees), interpreted as:
  *                 - Joints 1..4: delta angle for this timestep (typically
  *                   one 20 ms sample at 50 Hz). Step commands accumulate
  *                   (AccelStepper::move) so bursts do not cancel in-flight motion.
  *                 - Joints 5..6: absolute joint angles (deg) for the differential
  *                   wrist; not accumulated across rows.
  *
- *        [6..11]  Joint 1..6 velocity (deg/s). Used as motion rate hints:
+ *        [6]      Gripper: passed to Servo.write (clamped 0..180).
+ *
+ *        [7..12]  Joint 1..6 velocity (deg/s). Used as motion rate hints:
+ *     7-value row:
+ *        [0..5]   Joint 1..6 absolute positions (deg)
+ *        [6]      Gripper
+ *        Velocity defaults to 30 deg/s for all joints.
+ *
+ *   Commands:
+ *     ZERO        - Set internal commanded position state to zero for J1..J4.
+ *
  *                 - Stepper speeds use abs(velocity); step direction follows
  *                   the sign of the delta, not the velocity sign.
  *                 - Differential servos use max(abs(vel5), abs(vel6)) for slew.
- *
- *        [12]     Gripper: passed to Servo.write (clamped 0..180).
  *
  *   Board applies each received row immediately (commands may overlap).
  *
@@ -37,7 +45,7 @@
  *   FINISHED marks that the current commanded motion has settled.
  *
  * ERROR LINES (examples)
- *   ERR: row must have 13 numbers — bad row format.
+ *   ERR: row must have 7 or 13 numbers — bad row format.
  *
  * SIGN CONVENTIONS (software vs hardware)
  *   - Joint 2 and joint 4 stepper deltas are negated in moveSteppers() so
@@ -117,6 +125,7 @@
  const double US_PER_DEG = 2000.0 / 270.0;
  
  const double SERVO_SPEED_US_PER_SEC = 400.0;
+const float DEFAULT_COMMAND_VEL_DEG_S = 30.0f;
  const int UPDATE_PERIOD_MS = 20;
  
  int currentPwmA = PWM_CENTER;
@@ -132,20 +141,24 @@
  const double closeAngle = 100; //60
  
  struct TrajectoryPoint {
-   // J1..J4: delta per timestep (deg). J5..J6: absolute joint angle (deg).
-   float deltaDeg[6];
+  // J1..J6: absolute joint angles (deg).
+  float absDeg[6];
    float velocityDeg[6];  // J1..J6 velocity (deg/s)
    float gripperPos;      // Gripper angle command
  };
  
  bool isExecutingTrajectory = false;
  bool finishedFlagSent = false;
+// Internal commanded absolute state for steppers J1..J4 (deg).
+float commandedAbsDeg[4] = {0.0f, 0.0f, 0.0f, 0.0f};
  
  bool parseFloatLine(const String& line, float* values, int expectedCount);
  void handleSerialInput();
  void loadTrajectoryRow(const String& line);
+bool handleTextCommand(const String& line);
+void zeroPositionState();
  void dispatchTrajectoryPoint(const TrajectoryPoint& p);
- void moveSteppers(float dJ1, float dJ2, float dJ3, float dJ4,
+void moveSteppersAbsolute(float aJ1, float aJ2, float aJ3, float aJ4,
                    float vJ1, float vJ2, float vJ3, float vJ4);
  void moveDifferential(double angle5, double angle6, double vel5, double vel6);
  void moveEndEffector(float gripperPos);
@@ -158,23 +171,18 @@
  
  void setup() {
  
-   Serial.begin(250000);
+   Serial.begin(115200);
  
    pinMode(STEPPER_ENABLE, OUTPUT);
    digitalWrite(STEPPER_ENABLE, LOW);   // Enable drivers
  
    stepper1.setMaxSpeed(4000);
-   stepper1.setAcceleration(6000);
  
-   stepper2.setMaxSpeed(13000);
-   stepper2.setAcceleration(19500);
+   stepper2.setMaxSpeed(10000);
 
- 
-   stepper3.setMaxSpeed(13000);
-   stepper3.setAcceleration(19500);
+   stepper3.setMaxSpeed(10000);
  
    stepper4.setMaxSpeed(4000);
-   stepper4.setAcceleration(6000);
 
  
    servoA.attach(SERVO_A_PIN);
@@ -214,8 +222,18 @@
  // ===== STEPPER MOVE =====
  //////////////////////////////
  
- void moveSteppers(float dJ1, float dJ2, float dJ3, float dJ4,
+void moveSteppersAbsolute(float aJ1, float aJ2, float aJ3, float aJ4,
                    float vJ1, float vJ2, float vJ3, float vJ4) {
+  // Convert absolute commanded angles to incremental deltas for AccelStepper::move().
+  float dJ1 = aJ1 - commandedAbsDeg[0];
+  float dJ2 = aJ2 - commandedAbsDeg[1];
+  float dJ3 = aJ3 - commandedAbsDeg[2];
+  float dJ4 = aJ4 - commandedAbsDeg[3];
+
+  commandedAbsDeg[0] = aJ1;
+  commandedAbsDeg[1] = aJ2;
+  commandedAbsDeg[2] = aJ3;
+  commandedAbsDeg[3] = aJ4;
  
    // Positive direction reversed for joints 2 and 4 (hardware convention).
    dJ2 = -dJ2;
@@ -331,26 +349,53 @@
    if (line.length() == 0) {
      return;
    }
+  if (handleTextCommand(line)) {
+    return;
+  }
    loadTrajectoryRow(line);
  }
+
+bool handleTextCommand(const String& line) {
+  if (line == "ZERO") {
+    zeroPositionState();
+    Serial.println("OK: ZERO");
+    return true;
+  }
+  return false;
+}
+
+void zeroPositionState() {
+  commandedAbsDeg[0] = 0.0f;
+  commandedAbsDeg[1] = 0.0f;
+  commandedAbsDeg[2] = 0.0f;
+  commandedAbsDeg[3] = 0.0f;
+  stepper1.setCurrentPosition(0);
+  stepper2.setCurrentPosition(0);
+  stepper3.setCurrentPosition(0);
+  stepper4.setCurrentPosition(0);
+}
  
  void loadTrajectoryRow(const String& line) {
    float values[13];
-   if (!parseFloatLine(line, values, 13)) {
-     Serial.println("ERR: row must have 13 numbers");
+  bool parsed13 = parseFloatLine(line, values, 13);
+  bool parsed7 = false;
+  if (!parsed13) {
+    parsed7 = parseFloatLine(line, values, 7);
+  }
+  if (!parsed13 && !parsed7) {
+    Serial.println("ERR: row must have 7 or 13 numbers");
      return;
    }
  
    TrajectoryPoint p;
-   for (int i = 0; i < 6; i++) {
-     p.deltaDeg[i] = values[i];
-     p.velocityDeg[i] = values[i + 6];
-   }
-   p.gripperPos = values[12];
+  for (int i = 0; i < 6; i++) {
+    p.absDeg[i] = values[i];
+    p.velocityDeg[i] = parsed13 ? values[i + 7] : DEFAULT_COMMAND_VEL_DEG_S;
+  }
+  p.gripperPos = values[6];
  
-  // Apply immediately even if previous motion is still in-flight.
-  // AccelStepper::move() accumulates relative to the current target, so
-  // overlapping commands effectively "add" new deltas to the active move.
+ // Apply immediately. J1..J4 are absolute and converted to incremental motion
+ // against internal commandedAbsDeg[].
   dispatchTrajectoryPoint(p);
   isExecutingTrajectory = true;
   finishedFlagSent = false;
@@ -358,14 +403,14 @@
  
  void dispatchTrajectoryPoint(const TrajectoryPoint& p) {
  
-   moveSteppers(
-     p.deltaDeg[0], p.deltaDeg[1], p.deltaDeg[2], p.deltaDeg[3],
+  moveSteppersAbsolute(
+    p.absDeg[0], p.absDeg[1], p.absDeg[2], p.absDeg[3],
      p.velocityDeg[0], p.velocityDeg[1], p.velocityDeg[2], p.velocityDeg[3]
    );
  
    // J5/J6: absolute positions. Joint 6 sign is flipped in the differential mix
    // (the composed sixth axis), not by inverting a single servo only.
-   moveDifferential(p.deltaDeg[4], -p.deltaDeg[5], p.velocityDeg[4], -p.velocityDeg[5]);
+  moveDifferential(p.absDeg[4], -p.absDeg[5], p.velocityDeg[4], -p.velocityDeg[5]);
    moveEndEffector(p.gripperPos);
  }
  
