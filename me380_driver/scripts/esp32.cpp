@@ -29,19 +29,14 @@
  *
  *        [12]     Gripper: passed to Servo.write (clamped 0..180).
  *
- *   Board stores incoming rows in a ring buffer (TRAJ_BUFFER_POINTS) and
- *   executes one buffered row at a time (strictly sequential commands).
+ *   Board applies each received row immediately (commands may overlap).
  *
- *   If a new row arrives while motion is still running, it is queued (unless
- *   the buffer is full). This allows pipelined command streaming.
- *
- *   After the queue drains and all mechanics reach target, board sends:
+ *   When the mechanics reach target, board sends:
  *      FINISHED
  *
- *   FINISHED marks that all queued commands are done and motion has settled.
+ *   FINISHED marks that the current commanded motion has settled.
  *
  * ERROR LINES (examples)
- *   ERR: buffer full           — queue full; retry later.
  *   ERR: row must have 13 numbers — bad row format.
  *
  * SIGN CONVENTIONS (software vs hardware)
@@ -123,7 +118,6 @@
  
  const double SERVO_SPEED_US_PER_SEC = 400.0;
  const int UPDATE_PERIOD_MS = 20;
- const int TRAJ_BUFFER_POINTS = 8;
  
  int currentPwmA = PWM_CENTER;
  int currentPwmB = PWM_CENTER;
@@ -144,10 +138,6 @@
    float gripperPos;      // Gripper angle command
  };
  
- TrajectoryPoint trajBuffer[TRAJ_BUFFER_POINTS];
- int trajHead = 0;
- int trajTail = 0;
- int trajBufferedCount = 0;
  bool isExecutingTrajectory = false;
  bool finishedFlagSent = false;
  
@@ -168,18 +158,24 @@
  
  void setup() {
  
-   Serial.begin(115200);
+   Serial.begin(250000);
  
    pinMode(STEPPER_ENABLE, OUTPUT);
    digitalWrite(STEPPER_ENABLE, LOW);   // Enable drivers
  
    stepper1.setMaxSpeed(4000);
+   stepper1.setAcceleration(6000);
  
-   stepper2.setMaxSpeed(10000);
+   stepper2.setMaxSpeed(13000);
+   stepper2.setAcceleration(19500);
+
  
-   stepper3.setMaxSpeed(10000);
+   stepper3.setMaxSpeed(13000);
+   stepper3.setAcceleration(19500);
  
    stepper4.setMaxSpeed(4000);
+   stepper4.setAcceleration(6000);
+
  
    servoA.attach(SERVO_A_PIN);
    servoB.attach(SERVO_B_PIN);
@@ -205,16 +201,6 @@
  
    updateServos();
    handleSerialInput();
- 
-   // Execute one queued command at a time.
-   if (!isExecutingTrajectory && trajBufferedCount > 0) {
-     const TrajectoryPoint p = trajBuffer[trajHead];
-     trajHead = (trajHead + 1) % TRAJ_BUFFER_POINTS;
-     trajBufferedCount--;
-     dispatchTrajectoryPoint(p);
-     isExecutingTrajectory = true;
-     finishedFlagSent = false;
-   }
  
    // Emit one FINISHED for this specific command when motion settles.
    if (isExecutingTrajectory && isMotionDone() && !finishedFlagSent) {
@@ -349,11 +335,6 @@
  }
  
  void loadTrajectoryRow(const String& line) {
-   if (trajBufferedCount >= TRAJ_BUFFER_POINTS) {
-     Serial.println("ERR: buffer full");
-     return;
-   }
- 
    float values[13];
    if (!parseFloatLine(line, values, 13)) {
      Serial.println("ERR: row must have 13 numbers");
@@ -367,13 +348,12 @@
    }
    p.gripperPos = values[12];
  
-   trajBuffer[trajTail] = p;
-   trajTail = (trajTail + 1) % TRAJ_BUFFER_POINTS;
-   trajBufferedCount++;
- 
-   if (!isExecutingTrajectory) {
-     finishedFlagSent = false;
-   }
+  // Apply immediately even if previous motion is still in-flight.
+  // AccelStepper::move() accumulates relative to the current target, so
+  // overlapping commands effectively "add" new deltas to the active move.
+  dispatchTrajectoryPoint(p);
+  isExecutingTrajectory = true;
+  finishedFlagSent = false;
  }
  
  void dispatchTrajectoryPoint(const TrajectoryPoint& p) {
